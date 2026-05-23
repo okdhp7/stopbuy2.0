@@ -1,0 +1,73 @@
+services:
+  agent:
+    build:
+      context: ./agent
+    image: stopbuy2-agent:dev
+    container_name: stopbuy2_agent_dev
+    command: ["watchfiles", "python server.py", "/app"]
+    environment:
+      AGENT_HOST: 0.0.0.0
+      AGENT_PORT: 8765
+      REGRET_THRESHOLD: ${REGRET_THRESHOLD:-0.4}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_MODEL_NAME: ${LLM_MODEL_NAME:-gpt-4o-mini}
+    volumes:
+      - ./agent:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 8765), 3); s.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  backend:
+    build:
+      context: ./backend
+    image: stopbuy2-backend:dev
+    container_name: stopbuy2_backend_dev
+    command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/backend"]
+    environment:
+      AGENT_WS_URL: ws://agent:8765
+      AGENT_TIMEOUT: 120
+      LOG_LEVEL: INFO
+    ports:
+      - "8010:8000"
+    volumes:
+      - ./backend:/app/backend
+    depends_on:
+      agent:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    image: stopbuy2-frontend:dev
+    container_name: stopbuy2_frontend_dev
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+      VITE_BACKEND_HTTP_URL: http://backend:8000
+      VITE_BACKEND_WS_PROXY_TARGET: ws://backend:8000
+    ports:
+      - "8080:5173"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    depends_on:
+      backend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:5173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  frontend_node_modules:

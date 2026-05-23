@@ -4,6 +4,8 @@ import path from "node:path";
 import { defineConfig } from "vite";
 
 const rootDir = import.meta.dirname;
+const backendHttpUrl = process.env.VITE_BACKEND_HTTP_URL || "http://127.0.0.1:8010";
+const backendWsProxyTarget = process.env.VITE_BACKEND_WS_PROXY_TARGET || "ws://127.0.0.1:8010";
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
@@ -23,12 +25,12 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/ws": {
-        target: "ws://127.0.0.1:8010",
+        target: backendWsProxyTarget,
         ws: true,
         changeOrigin: true,
       },
       "/health": {
-        target: "http://127.0.0.1:8010",
+        target: backendHttpUrl,
         changeOrigin: true,
       },
     },

@@ -23,9 +23,9 @@ StopBuy2.0/
     main.py
     requirements.txt
   frontend/
-    index.html
-    styles.css
-    app.js
+    client/
+    package.json
+    vite.config.ts
   run_agent.ps1
   run_backend.ps1
 ```
@@ -98,4 +98,31 @@ Stop services:
 
 ```powershell
 docker compose down
+```
+
+## Run With Docker Dev Reload
+
+Use the development compose file when you want source changes to be reflected automatically.
+
+```powershell
+cd C:\Users\user\Documents\Codex\2026-05-21\github-pr\StopBuy2.0
+docker compose -f docker-compose.dev.yml up --build
+```
+
+Open:
+
+```text
+http://127.0.0.1:8080
+```
+
+Reload behavior:
+
+- Frontend changes under `frontend/` are reflected by Vite HMR.
+- Backend changes under `backend/` restart `uvicorn` with `--reload`.
+- Agent changes under `agent/` restart `server.py` through `watchfiles`.
+
+Stop development services:
+
+```powershell
+docker compose -f docker-compose.dev.yml down
 ```

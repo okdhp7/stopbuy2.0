@@ -7,3 +7,4 @@ scikit-learn==1.5.2
 lightgbm==4.5.0
 joblib==1.4.2
 openai==1.57.0
+watchfiles==0.24.0
