@@ -88,18 +88,18 @@
 
   /* Text */
   --sb-text-primary: #E2E8F0;
-  --sb-text-secondary: #94A3B8;
-  --sb-text-muted: #64748B;
-  --sb-text-dim: #475569;
+  --sb-text-secondary: #CBD5E1;
+  --sb-text-muted: #AFC0D4;
+  --sb-text-dim: #8191A8;
 
   /* Interactive */
   --sb-tab-active-bg: rgba(59,130,246,0.15);
   --sb-tab-active-color: #60A5FA;
   --sb-tab-active-border: rgba(59,130,246,0.3);
-  --sb-tab-inactive-color: #64748B;
+  --sb-tab-inactive-color: #AFC0D4;
   --sb-badge-bg: rgba(255,255,255,0.06);
   --sb-badge-active-bg: rgba(59,130,246,0.25);
-  --sb-badge-color: #94A3B8;
+  --sb-badge-color: #CBD5E1;
   --sb-badge-active-color: #60A5FA;
 
   /* Accents */
@@ -314,7 +314,8 @@
 
   .btn-primary {
     background: var(--sb-blue);
-    color: #fff;
+    color: #FFFFFF;
+    font-weight: 700;
     transition: background 0.2s ease;
   }
   .btn-primary:hover { background: var(--sb-blue-dark); }
