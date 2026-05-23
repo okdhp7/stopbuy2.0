@@ -3,6 +3,7 @@
  * Design: "Analytical Dual Theme" — CSS 변수(--sb-*) 기반 색상 처리
  */
 import { Brain, Search, Sparkles, CheckCircle2 } from "lucide-react";
+import { useEffect, useState } from "react";
 
 interface AnalysisProgressProps {
   progress: number;
@@ -17,6 +18,16 @@ const STEPS = [
 ];
 
 export function AnalysisProgress({ progress, message }: AnalysisProgressProps) {
+  const [displayProgress, setDisplayProgress] = useState(progress);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDisplayProgress(progress);
+    }, 500);
+
+    return () => window.clearTimeout(timer);
+  }, [progress]);
+
   return (
     <div className="flex flex-col items-center gap-8 py-8 px-4">
       {/* 메인 진행 바 */}
@@ -27,7 +38,7 @@ export function AnalysisProgress({ progress, message }: AnalysisProgressProps) {
             className="text-sm font-semibold"
             style={{ fontFamily: "'Space Grotesk', monospace", color: "var(--sb-blue-light)" }}
           >
-            {progress}%
+            {displayProgress}%
           </span>
         </div>
         <div
@@ -37,7 +48,7 @@ export function AnalysisProgress({ progress, message }: AnalysisProgressProps) {
           <div
             className="h-full rounded-full transition-all duration-500 ease-out"
             style={{
-              width: `${progress}%`,
+              width: `${displayProgress}%`,
               background: "linear-gradient(90deg, var(--sb-blue), var(--sb-blue-dark))",
               boxShadow: "0 0 12px color-mix(in oklch, var(--sb-blue) 50%, transparent)",
             }}
@@ -48,15 +59,19 @@ export function AnalysisProgress({ progress, message }: AnalysisProgressProps) {
       {/* 단계 표시 */}
       <div className="flex gap-6 flex-wrap justify-center">
         {STEPS.map((step, idx) => {
-          const isCompleted = progress >= step.threshold;
+          const isCompleted = displayProgress >= step.threshold;
           const isActive =
-            progress >= (STEPS[idx - 1]?.threshold ?? 0) && progress < step.threshold;
+            displayProgress >= (STEPS[idx - 1]?.threshold ?? 0) &&
+            displayProgress < step.threshold;
 
           return (
             <div
               key={step.label}
               className="flex flex-col items-center gap-2"
-              style={{ opacity: isCompleted || isActive ? 1 : 0.3 }}
+              style={{
+                opacity: isCompleted || isActive ? 1 : 0.3,
+                transitionDelay: `${idx * 120}ms`,
+              }}
             >
               <div
                 className="w-10 h-10 rounded-full flex items-center justify-center transition-all duration-300"
