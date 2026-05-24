@@ -8,6 +8,10 @@ from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
 
+from env_loader import load_dotenv
+
+
+load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")

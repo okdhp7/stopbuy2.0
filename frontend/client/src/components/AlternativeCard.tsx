@@ -66,7 +66,7 @@ export function AlternativeCard({ product, rank, targetRegretScore, style }: Alt
           <img
             src={productImageUrl}
             alt={product.name || "상품 이미지"}
-            className="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
+            className="w-full h-full object-contain p-3 transition-transform duration-300 group-hover:scale-105"
             onError={(e) => {
               (e.target as HTMLImageElement).src = PRODUCT_PLACEHOLDER_IMAGE;
             }}

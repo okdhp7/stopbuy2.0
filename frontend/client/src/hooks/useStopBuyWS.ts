@@ -52,6 +52,8 @@ export interface AnalysisResult {
   regret_level?: RegretLevel;
   model_regret_score?: number;
   cause_score?: number;
+  threshold?: number;
+  should_reconsider?: boolean;
   regret_causes?: RegretCause[];
   regret_reasons?: string[];
   alternatives?: AlternativeProduct[];
@@ -118,6 +120,22 @@ function getBackendWsUrl(): string {
   return `${protocol}//${window.location.host}/ws`;
 }
 
+function shouldShowAlternatives(result: AnalysisResult): boolean {
+  if (typeof result.should_reconsider === "boolean") {
+    return result.should_reconsider;
+  }
+
+  const threshold = result.threshold ?? 0.4;
+  return (result.regret_score ?? 0) >= threshold;
+}
+
+function normalizeAgentResult(result: AnalysisResult): AnalysisResult {
+  return {
+    ...result,
+    alternatives: shouldShowAlternatives(result) ? result.alternatives ?? [] : [],
+  };
+}
+
 // ─── 데모 모드: 백엔드 미연결 시 사용 ───────────────────────────────────
 function generateDemoResult(params: {
   inputType: string;
@@ -177,9 +195,8 @@ function generateDemoResult(params: {
     });
   }
 
-  const alternatives: AlternativeProduct[] =
-    level !== "low"
-      ? [
+  const shouldReconsider = score >= 0.4;
+  const alternatives: AlternativeProduct[] = shouldReconsider ? [
           {
             product_id: 1,
             name: "갤럭시 S24 FE",
@@ -188,6 +205,7 @@ function generateDemoResult(params: {
             price: 699000,
             rating: 4.3,
             return_rate: 3.2,
+            image_url: "https://fdn2.gsmarena.com/vv/bigpic/samsung-galaxy-s24-fe.jpg",
             regret_score: 0.22,
             recommendation_reason: "높은 평점과 낮은 반품률로 만족도가 검증된 상품입니다.",
           },
@@ -199,6 +217,7 @@ function generateDemoResult(params: {
             price: 1250000,
             rating: 4.6,
             return_rate: 2.1,
+            image_url: "https://fdn2.gsmarena.com/vv/pics/apple/apple-iphone-15-1.jpg",
             regret_score: 0.15,
             recommendation_reason: "업계 최고 수준의 사용자 만족도를 보유한 프리미엄 선택지입니다.",
           },
@@ -210,11 +229,35 @@ function generateDemoResult(params: {
             price: 649000,
             rating: 4.4,
             return_rate: 2.8,
+            image_url: "https://fdn2.gsmarena.com/vv/bigpic/google-pixel-8a.jpg",
             regret_score: 0.19,
             recommendation_reason: "합리적인 가격에 순수 안드로이드 경험을 제공합니다.",
           },
-        ]
-      : [];
+          {
+            product_id: 4,
+            name: "Xiaomi 14T",
+            brand: "Xiaomi",
+            category: params.product?.category || "?ㅻ쭏?명룿",
+            price: 599000,
+            rating: 4.2,
+            return_rate: 3.4,
+            image_url: "https://fdn2.gsmarena.com/vv/bigpic/xiaomi-14t.jpg",
+            regret_score: 0.24,
+            recommendation_reason: "가격 대비 성능이 좋아 예산 부담을 낮출 수 있는 선택지입니다.",
+          },
+          {
+            product_id: 5,
+            name: "OnePlus 12R",
+            brand: "OnePlus",
+            category: params.product?.category || "?ㅻ쭏?명룿",
+            price: 749000,
+            rating: 4.3,
+            return_rate: 3.0,
+            image_url: "https://fdn2.gsmarena.com/vv/bigpic/oneplus-12r.jpg",
+            regret_score: 0.21,
+            recommendation_reason: "성능과 배터리 만족도가 균형 잡힌 대체상품입니다.",
+          },
+        ] : [];
 
   return {
     product_name: name,
@@ -222,6 +265,8 @@ function generateDemoResult(params: {
     regret_level: level,
     model_regret_score: score * 0.9,
     cause_score: score * 0.8,
+    threshold: 0.4,
+    should_reconsider: shouldReconsider,
     regret_causes: causes,
     alternatives,
     llm_analysis: {
@@ -259,11 +304,24 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
 
   const wsRef = useRef<WebSocket | null>(null);
   const pendingRequestRef = useRef<{ type: string; session_id: string; data: object } | null>(null);
-  const demoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const demoTimerRef = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const completionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const retryCountRef = useRef(0);
 
   const backendWsUrl = options.backendUrl || getBackendWsUrl();
   const wsUrl = `${backendWsUrl}/${sessionId}`;
+
+  const clearDemoTimers = useCallback(() => {
+    demoTimerRef.current.forEach((timer) => clearTimeout(timer));
+    demoTimerRef.current = [];
+  }, []);
+
+  const clearCompletionTimer = useCallback(() => {
+    if (completionTimerRef.current) {
+      clearTimeout(completionTimerRef.current);
+      completionTimerRef.current = null;
+    }
+  }, []);
 
   const handleMessage = useCallback((message: {
     type: string;
@@ -277,15 +335,19 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
       setProgress(message.progress || 0);
       setProgressMessage(message.message || "분석 중...");
     } else if (type === "result") {
-      setResult(message.data || null);
+      setResult(message.data ? normalizeAgentResult(message.data) : null);
       setProgress(100);
       setProgressMessage("분석 완료!");
-      setStatus("completed");
+      clearCompletionTimer();
+      completionTimerRef.current = setTimeout(() => {
+        setStatus("completed");
+        completionTimerRef.current = null;
+      }, 2000);
     } else if (type === "error") {
       setError(message.message || "알 수 없는 오류가 발생했습니다.");
       setStatus("error");
     }
-  }, []);
+  }, [clearCompletionTimer]);
 
   const runDemoMode = useCallback(
     (params: {
@@ -296,51 +358,44 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
       product?: ProductInfo;
     }) => {
       const steps = [
-        { progress: 15, message: "상품 정보 수집 중...", delay: 400 },
-        { progress: 35, message: "후회 패턴 분석 중...", delay: 900 },
-        { progress: 60, message: "머신러닝 모델 예측 중...", delay: 1600 },
-        { progress: 80, message: "대체상품 검색 중...", delay: 2400 },
-        { progress: 95, message: "결과 정리 중...", delay: 3000 },
+        { progress: 15, message: "상품 정보 수집 중...", delay: 2000 },
+        { progress: 35, message: "후회 패턴 분석 중...", delay: 4000 },
+        { progress: 60, message: "머신러닝 모델 예측 중...", delay: 6000 },
+        { progress: 80, message: "대체상품 검색 중...", delay: 8000 },
+        { progress: 95, message: "결과 정리 중...", delay: 10000 },
       ];
 
+      clearDemoTimers();
       steps.forEach(({ progress, message, delay }) => {
-        demoTimerRef.current = setTimeout(() => {
+        const timer = setTimeout(() => {
           setProgress(progress);
           setProgressMessage(message);
         }, delay);
+        demoTimerRef.current.push(timer);
       });
 
-      demoTimerRef.current = setTimeout(() => {
+      const resultTimer = setTimeout(() => {
         const demoResult = generateDemoResult(params);
         setResult(demoResult);
         setProgress(100);
         setProgressMessage("분석 완료! (데모 모드)");
-        setStatus("completed");
-      }, 3600);
+        clearCompletionTimer();
+        completionTimerRef.current = setTimeout(() => {
+          setStatus("completed");
+          completionTimerRef.current = null;
+        }, 2000);
+      }, 12000);
+      demoTimerRef.current.push(resultTimer);
     },
-    []
+    [clearDemoTimers, clearCompletionTimer]
   );
 
-  const fallbackToDemo = useCallback(
-    (pending: { type: string; session_id: string; data: object }) => {
-      const data = pending.data as {
-        input_type: "url" | "image" | "manual";
-        product_url?: string;
-        image_base64?: string;
-        user?: UserProfile;
-        product?: ProductInfo;
-      };
-      setStatus("analyzing");
-      runDemoMode({
-        inputType: data.input_type,
-        productUrl: data.product_url,
-        imageBase64: data.image_base64,
-        user: data.user,
-        product: data.product,
-      });
-    },
-    [runDemoMode]
-  );
+  const failAgentRequest = useCallback(() => {
+    clearDemoTimers();
+    clearCompletionTimer();
+    setError("AI Agent에 분석을 요청하지 못했습니다. 백엔드와 Agent 컨테이너 상태를 확인해 주세요.");
+    setStatus("error");
+  }, [clearDemoTimers, clearCompletionTimer]);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -361,10 +416,9 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
               retryCountRef.current += 1;
               setTimeout(() => connect(), 2000);
             } else {
-              const pending = pendingRequestRef.current;
               pendingRequestRef.current = null;
               retryCountRef.current = 0;
-              fallbackToDemo(pending);
+              failAgentRequest();
             }
           }
         }
@@ -406,23 +460,21 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
             retryCountRef.current += 1;
             setTimeout(() => connect(), 2000);
           } else {
-            const pending = pendingRequestRef.current;
             pendingRequestRef.current = null;
             retryCountRef.current = 0;
-            fallbackToDemo(pending);
+            failAgentRequest();
           }
         }
       };
     } catch (err) {
       console.error("WebSocket 생성 실패:", err);
       if (pendingRequestRef.current) {
-        const pending = pendingRequestRef.current;
         pendingRequestRef.current = null;
         retryCountRef.current = 0;
-        fallbackToDemo(pending);
+        failAgentRequest();
       }
     }
-  }, [wsUrl, handleMessage, fallbackToDemo]);
+  }, [wsUrl, handleMessage, failAgentRequest]);
 
   const analyze = useCallback(
     (params: {
@@ -433,6 +485,8 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
       product?: ProductInfo;
     }) => {
       setStatus("connecting");
+      clearDemoTimers();
+      clearCompletionTimer();
       setProgress(5);
       setProgressMessage("서버에 연결 중...");
       setResult(null);
@@ -461,25 +515,27 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
         connect();
       }
     },
-    [sessionId, connect]
+    [sessionId, connect, clearDemoTimers, clearCompletionTimer]
   );
 
   const reset = useCallback(() => {
-    if (demoTimerRef.current) clearTimeout(demoTimerRef.current);
+    clearDemoTimers();
+    clearCompletionTimer();
     setStatus("idle");
     setProgress(0);
     setProgressMessage("");
     setResult(null);
     setError(null);
     retryCountRef.current = 0;
-  }, []);
+  }, [clearDemoTimers, clearCompletionTimer]);
 
   useEffect(() => {
     return () => {
-      if (demoTimerRef.current) clearTimeout(demoTimerRef.current);
+      clearDemoTimers();
+      clearCompletionTimer();
       wsRef.current?.close();
     };
-  }, []);
+  }, [clearDemoTimers, clearCompletionTimer]);
 
   return {
     status,

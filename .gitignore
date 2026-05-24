@@ -4,3 +4,4 @@ __pycache__/
 agent/models/*.pkl
 *.log
 .env
+node_modules/

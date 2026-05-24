@@ -8,6 +8,33 @@ type ProductImageRule = {
   imageUrl: string;
 };
 
+const EXACT_PRODUCT_IMAGE_RULES: ProductImageRule[] = [
+  {
+    keywords: ["galaxy s24 fe", "s24 fe"],
+    imageUrl: "https://fdn2.gsmarena.com/vv/bigpic/samsung-galaxy-s24-fe.jpg",
+  },
+  {
+    keywords: ["iphone 15"],
+    imageUrl: "https://fdn2.gsmarena.com/vv/pics/apple/apple-iphone-15-1.jpg",
+  },
+  {
+    keywords: ["pixel 8a"],
+    imageUrl: "https://fdn2.gsmarena.com/vv/bigpic/google-pixel-8a.jpg",
+  },
+  {
+    keywords: ["xiaomi 14t"],
+    imageUrl: "https://fdn2.gsmarena.com/vv/bigpic/xiaomi-14t.jpg",
+  },
+  {
+    keywords: ["oneplus 12r"],
+    imageUrl: "https://fdn2.gsmarena.com/vv/bigpic/oneplus-12r.jpg",
+  },
+  {
+    keywords: ["nothing phone 2a"],
+    imageUrl: "https://fdn2.gsmarena.com/vv/bigpic/nothing-phone-2a.jpg",
+  },
+];
+
 const PRODUCT_IMAGE_RULES: ProductImageRule[] = [
   {
     keywords: ["macbook", "맥북", "galaxybook", "갤럭시북", "그램", "xps", "spectre", "ideapad", "노트북", "laptop"],
@@ -103,6 +130,14 @@ export function getAlternativeProductImage(product: AlternativeProduct): string 
   const searchableText = normalize(
     [product.name, product.brand, product.category].filter(Boolean).join(" "),
   );
+
+  const exactMatch = EXACT_PRODUCT_IMAGE_RULES.find((rule) =>
+    rule.keywords.some((keyword) => searchableText.includes(keyword.toLowerCase())),
+  );
+
+  if (exactMatch) {
+    return exactMatch.imageUrl;
+  }
 
   const matchedRule = PRODUCT_IMAGE_RULES.find((rule) =>
     rule.keywords.some((keyword) => searchableText.includes(keyword.toLowerCase())),

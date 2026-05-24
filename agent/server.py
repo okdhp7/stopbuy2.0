@@ -7,6 +7,10 @@ from typing import Any, Dict
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
+from env_loader import load_dotenv
+
+load_dotenv()
+
 from product_extractor import extract_product_info
 from predictor import RegretPredictor
 
@@ -20,11 +24,47 @@ logger = logging.getLogger("stopbuy-agent")
 AGENT_HOST = os.getenv("AGENT_HOST", "127.0.0.1")
 AGENT_PORT = int(os.getenv("AGENT_PORT", "8765"))
 REGRET_THRESHOLD = float(os.getenv("REGRET_THRESHOLD", "0.4"))
+LOG_PAYLOAD_MAX_LENGTH = int(os.getenv("LOG_PAYLOAD_MAX_LENGTH", "4000"))
+MODEL_PATH = os.getenv("REGRET_MODEL_PATH")
+DATASET_PATH = os.getenv("REGRET_DATASET_PATH")
 
-predictor = RegretPredictor(threshold=REGRET_THRESHOLD)
+predictor = RegretPredictor(
+    model_path=MODEL_PATH,
+    dataset_path=DATASET_PATH,
+    threshold=REGRET_THRESHOLD,
+)
+
+
+def redact_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: Dict[str, Any] = {}
+        for key, item in value.items():
+            if key in {"image_base64", "base64"} and isinstance(item, str):
+                redacted[key] = f"<base64 length={len(item)}>"
+            elif key in {"image_url", "product_url", "source_url"} and isinstance(item, str) and item.startswith("data:"):
+                redacted[key] = f"<data-url length={len(item)}>"
+            else:
+                redacted[key] = redact_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_payload(item) for item in value]
+    return value
+
+
+def log_payload(direction: str, payload: Dict[str, Any]) -> None:
+    try:
+        text = json.dumps(redact_payload(payload), ensure_ascii=False, default=str, indent=2)
+    except Exception:
+        text = repr(payload)
+
+    if len(text) > LOG_PAYLOAD_MAX_LENGTH:
+        text = f"{text[:LOG_PAYLOAD_MAX_LENGTH]}... <truncated length={len(text)}>"
+
+    logger.info("agent %s payload: %s", direction, text)
 
 
 async def send_message(ws: ServerConnection, message: Dict[str, Any]) -> None:
+    log_payload("send", message)
     await ws.send(json.dumps(message, ensure_ascii=False))
 
 
@@ -75,6 +115,7 @@ async def handle_client(ws: ServerConnection) -> None:
                 await send_message(ws, {"type": "error", "message": "잘못된 JSON 메시지입니다."})
                 continue
 
+            log_payload("recv", message)
             msg_type = message.get("type")
             session_id = message.get("session_id") or "unknown"
             if msg_type == "ping":

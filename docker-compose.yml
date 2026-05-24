@@ -8,10 +8,11 @@ services:
       AGENT_HOST: 0.0.0.0
       AGENT_PORT: 8765
       REGRET_THRESHOLD: ${REGRET_THRESHOLD:-0.4}
+      REGRET_MODEL_PATH: /app/models/regret_model.pkl
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       LLM_MODEL_NAME: ${LLM_MODEL_NAME:-gpt-4o-mini}
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 8765), 3); s.close()"]
+      test: ["CMD", "python", "-c", "from websockets.sync.client import connect; ws=connect('ws://127.0.0.1:8765', open_timeout=3); ws.close()"]
       interval: 10s
       timeout: 5s
       retries: 5
