@@ -23,7 +23,7 @@ export function AnalysisProgress({ progress, message }: AnalysisProgressProps) {
   useEffect(() => {
     const timer = window.setTimeout(() => {
       setDisplayProgress(progress);
-    }, 500);
+    }, 1000);
 
     return () => window.clearTimeout(timer);
   }, [progress]);
