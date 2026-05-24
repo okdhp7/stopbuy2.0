@@ -26,13 +26,19 @@ CATEGORY_KEYWORDS = {
 }
 
 
-def _clean_text(value: Optional[str]) -> Optional[str]:
+## 문자열의 연속 공백을 정리하고 비어 있으면 None을 반환합니다.
+def _clean_text(
+    value: Optional[str],
+) -> Optional[str]:
     if not value:
         return None
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _number_from_text(text: str) -> Optional[float]:
+## 텍스트에서 첫 번째 숫자 또는 콤마 포함 숫자를 추출해 float로 변환합니다.
+def _number_from_text(
+    text: str,
+) -> Optional[float]:
     match = re.search(r"(\d{1,3}(?:,\d{3})+|\d+)", text)
     if not match:
         return None
@@ -42,7 +48,10 @@ def _number_from_text(text: str) -> Optional[float]:
         return None
 
 
-def detect_category(text: str) -> Optional[str]:
+## 상품명/설명 텍스트에서 키워드 기반으로 상품 카테고리를 추론합니다.
+def detect_category(
+    text: str,
+) -> Optional[str]:
     lowered = text.lower()
     for category, keywords in CATEGORY_KEYWORDS.items():
         if any(keyword.lower() in lowered for keyword in keywords):
@@ -50,7 +59,10 @@ def detect_category(text: str) -> Optional[str]:
     return None
 
 
-def detect_shop(url: str) -> str:
+## 상품 URL의 호스트명을 기준으로 쇼핑몰 식별자를 반환합니다.
+def detect_shop(
+    url: str,
+) -> str:
     host = urlparse(url).netloc.lower()
     if "coupang" in host:
         return "coupang"
@@ -65,7 +77,10 @@ def detect_shop(url: str) -> str:
     return "generic"
 
 
-def parse_json_ld(soup: BeautifulSoup) -> Dict[str, Any]:
+## HTML의 JSON-LD Product 데이터를 읽어 상품 정보를 추출합니다.
+def parse_json_ld(
+    soup: BeautifulSoup,
+) -> Dict[str, Any]:
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "")
@@ -114,7 +129,10 @@ def parse_json_ld(soup: BeautifulSoup) -> Dict[str, Any]:
     return {}
 
 
-async def extract_from_url(url: str) -> Dict[str, Any]:
+## URL 페이지를 가져와 메타태그, JSON-LD, 본문 텍스트에서 상품 정보를 추출합니다.
+async def extract_from_url(
+    url: str,
+) -> Dict[str, Any]:
     headers = {
         "User-Agent": "Mozilla/5.0 StopBuy2.0 Product Analyzer",
         "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -167,7 +185,10 @@ async def extract_from_url(url: str) -> Dict[str, Any]:
     return product
 
 
-async def extract_from_image(image_base64: str) -> Dict[str, Any]:
+## base64 이미지에서 OpenAI 비전 모델을 사용해 상품 정보를 추출합니다.
+async def extract_from_image(
+    image_base64: str,
+) -> Dict[str, Any]:
     if not OPENAI_API_KEY:
         return {
             "name": "이미지 입력 상품",
@@ -231,7 +252,10 @@ async def extract_from_image(image_base64: str) -> Dict[str, Any]:
         }
 
 
-async def extract_product_info(data: Dict[str, Any]) -> Dict[str, Any]:
+## 입력 타입에 따라 URL, 이미지, 수동 입력 중 적절한 상품 추출 경로를 선택합니다.
+async def extract_product_info(
+    data: Dict[str, Any],
+) -> Dict[str, Any]:
     input_type = data.get("input_type", "manual")
     if input_type == "url" and data.get("product_url"):
         return await extract_from_url(data["product_url"])
