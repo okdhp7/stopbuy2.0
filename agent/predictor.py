@@ -50,6 +50,12 @@ PRODUCT_IMAGE_URLS = {
     "xiaomi 14t": "https://fdn2.gsmarena.com/vv/bigpic/xiaomi-14t.jpg",
     "oneplus 12r": "https://fdn2.gsmarena.com/vv/bigpic/oneplus-12r.jpg",
     "nothing phone 2a": "https://fdn2.gsmarena.com/vv/bigpic/nothing-phone-2a.jpg",
+    "macbook air m3": "https://store.storeimages.cdn-apple.com/4982/as-images.apple.com/is/mba13-m3-midnight-gallery1-202402?wid=900&hei=600&fmt=jpeg&qlt=90&.v=1707416815196",
+    "sony wh-1000xm5": "https://mma.prnewswire.com/media/1816079/Sony_WH_1000XM5_headphones.jpg?p=publish",
+    "airpods pro 2": "https://store.storeimages.cdn-apple.com/4982/as-images.apple.com/is/MQD83?wid=900&hei=600&fmt=png-alpha&.v=1660803972361",
+    "bose quietcomfort ultra": "https://assets.bosecreative.com/transform/775c3e9a-fcd1-489f-a2f7-a57ac66464e1/SF_QCUH_deepplum_gallery_1_816x612_x2?io=width%3A816%2Cheight%3A667%2Ctransform%3Afit&quality=90",
+    "galaxy buds3 pro": "https://api.samsungmobilepress.com/api/v1/file/A883670379D5943613666FC47FDF336B969C8DAB0EE5DB9678DE17F1835EB12061AC10F8380C857FB887A4DA4D5CFD522B5EE84E4BE72A7B91D06F877E9ADFD4AF4A4E99108B76E53EE5FD7DB9A33BF4EF185AD10D51B1C0FEDFF15A6BAE9B98F7E8754FA83F81FA804EAC2ED054D34AA29D19123081709FE794338202CFD7F1",
+    "jbl tour pro 3": "https://jblstore.co.id/wp-content/uploads/2024/11/01.LS-JBL-Tour-Pro-3-Product-Image-Case-Open-Black-600x600.webp",
 }
 
 
@@ -145,11 +151,33 @@ def price_grade(
     return "초고가"
 
 
+## Estimate a conservative price when online extraction does not include one.
+def estimate_missing_price(
+    product: Dict[str, Any],
+) -> float:
+    name = str(product.get("name") or "").lower()
+    category = str(product.get("category") or "").lower()
+    brand = str(product.get("brand") or "").lower()
+    source = f"{name} {category} {brand}"
+
+    if any(keyword in source for keyword in ["server", "proliant", "microserver", "hpe", "hewlett"]):
+        return 1_200_000
+    if any(keyword in source for keyword in ["macbook", "notebook", "laptop"]):
+        return 1_400_000
+    if any(keyword in source for keyword in ["iphone", "galaxy", "pixel", "phone"]):
+        return 900_000
+    if any(keyword in source for keyword in ["airpods", "buds", "earphone", "headphone"]):
+        return 250_000
+    return 300_000
+
+
 ## 입력 카테고리 문자열을 학습 데이터와 가까운 표준 카테고리로 정규화합니다.
 def normalize_category(
     category: Optional[str],
 ) -> str:
     text = str(category or "").lower()
+    if any(keyword in text for keyword in ["server", "proliant", "microserver"]):
+        return "전자기기"
     if any(keyword in text for keyword in ["phone", "iphone", "galaxy", "pixel", "스마트폰", "휴대폰"]):
         return "전자기기"
     if any(keyword in text for keyword in ["notebook", "laptop", "macbook", "노트북", "컴퓨터"]):
@@ -194,6 +222,9 @@ def normalize_brand(
         "oneplus": "원플러스",
         "nothing": "Nothing",
         "google": "구글",
+        "hpe": "HP",
+        "hewlett": "HP",
+        "proliant": "HP",
     }
     for keyword, value in brand_map.items():
         if keyword in source:
@@ -209,6 +240,7 @@ def build_training_row(
     price = safe_float(product.get("price"))
     review_count = safe_int(product.get("review_count"), 20)
     return_rate = safe_float(product.get("return_rate"), 5.0)
+    price_estimated = bool(product.get("price_estimated"))
     rating = safe_float(product.get("rating"), 3.5)
     budget = safe_float(user.get("budget"))
     category = normalize_category(product.get("category"))
@@ -247,9 +279,19 @@ def make_regret_causes(
     causes: List[Dict[str, Any]] = []
     budget = safe_float(user.get("budget"))
     price = safe_float(product.get("price"))
+    price_estimated = bool(product.get("price_estimated"))
     rating = safe_float(product.get("rating"), 3.5)
     return_rate = safe_float(product.get("return_rate"), 5.0)
     review_count = safe_int(product.get("review_count"))
+
+    if product.get("price_estimated"):
+        causes.append({
+            "code": "PRICE_ESTIMATED",
+            "title": "가격 정보 추정",
+            "message": "이미지 분석에서 가격이 확인되지 않아 상품명과 카테고리 기준으로 보수적 추정가를 적용했습니다.",
+            "severity": "medium",
+            "impact_score": 0.12,
+        })
 
     if budget > 0 and price > budget:
         over_ratio = (price - budget) / budget
@@ -310,6 +352,7 @@ def explicit_risk_score(
 ) -> float:
     budget = safe_float(user.get("budget"))
     price = safe_float(product.get("price"))
+    price_estimated = bool(product.get("price_estimated"))
     rating = safe_float(product.get("rating"), 3.5)
     return_rate = safe_float(product.get("return_rate"), 5.0)
     review_count = safe_int(product.get("review_count"))
@@ -330,6 +373,8 @@ def explicit_risk_score(
 
     if price >= 1_000_000 and (return_rate >= 10 or rating < 3.8):
         score += 0.1
+    if price_estimated:
+        score += 0.18
     return clamp_score(score)
 
 
@@ -702,11 +747,15 @@ class RegretPredictor:
         user: Dict[str, Any],
         product: Dict[str, Any],
     ) -> Dict[str, Any]:
+        raw_price = safe_float(product.get("price"))
+        price_estimated = raw_price <= 0
+        normalized_price = estimate_missing_price(product) if price_estimated else raw_price
         normalized_product = {
             "name": product.get("name") or "분석 대상 상품",
             "brand": product.get("brand"),
             "category": product.get("category"),
-            "price": safe_float(product.get("price")),
+            "price": normalized_price,
+            "price_estimated": price_estimated,
             "rating": safe_float(product.get("rating"), 3.5),
             "review_count": safe_int(product.get("review_count")),
             "return_rate": safe_float(product.get("return_rate"), 5.0),
@@ -733,6 +782,12 @@ class RegretPredictor:
             "regret_causes": score_result["regret_causes"],
             "regret_reasons": [cause["message"] for cause in score_result["regret_causes"]],
             "alternatives": alternatives,
+            "llm_analysis": self._llm_analysis(
+                normalized_product,
+                regret_score,
+                score_result["regret_causes"],
+                alternatives,
+            ),
             "model_metrics": self.model.metrics,
             "prediction_features": score_result["feature"],
             "summary": self._summary(normalized_product, regret_score, alternatives),
@@ -850,7 +905,51 @@ class RegretPredictor:
             reasons.append("선호 브랜드와 일치합니다")
         return ", ".join(reasons) if reasons else "현재 상품보다 종합 위험도가 낮은 대체 후보입니다"
 
-    ## 후회예측 결과와 대체상품 여부를 짧은 요약 문장으로 만듭니다.
+    ## Build the analysis object consumed by the frontend AI analysis tab.
+    def _llm_analysis(
+        self,
+        product: Dict[str, Any],
+        regret_score: float,
+        causes: List[Dict[str, Any]],
+        alternatives: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        percent = round(regret_score * 100)
+        major_causes = [cause for cause in causes if cause.get("code") != "NO_MAJOR_RISK"]
+        top_cause = major_causes[0] if major_causes else None
+        top_alternative = alternatives[0] if alternatives else None
+        product_name = product.get("name") or "\ubd84\uc11d \ub300\uc0c1 \uc0c1\ud488"
+
+        if regret_score >= 0.7:
+            tone = "\uad6c\ub9e4 \uc804 \uc7ac\uac80\ud1a0\uac00 \uac15\ud558\uac8c \ud544\uc694\ud55c \uc0c1\ud0dc\uc785\ub2c8\ub2e4"
+        elif regret_score >= 0.4:
+            tone = "\uba87 \uac00\uc9c0 \ud6c4\ud68c \uc694\uc778\uc774 \uc788\uc5b4 \uc2e0\uc911\ud55c \ube44\uad50\uac00 \ud544\uc694\ud55c \uc0c1\ud0dc\uc785\ub2c8\ub2e4"
+        else:
+            tone = "\ud604\uc7ac \uc785\ub825 \uc870\uac74\uc5d0\uc11c\ub294 \ube44\uad50\uc801 \ubd80\ub2f4\uc774 \ub0ae\uc740 \uc0c1\ud0dc\uc785\ub2c8\ub2e4"
+
+        risk_explanation = (
+            f"\uac00\uc7a5 \ud070 \uc704\ud5d8 \uc694\uc778\uc740 '{top_cause.get('title')}'\uc785\ub2c8\ub2e4. {top_cause.get('message')}"
+            if top_cause
+            else "\ud604\uc7ac \uc785\ub825 \uc870\uac74\uc5d0\uc11c\ub294 \ub69c\ub837\ud55c \uace0\uc704\ud5d8 \uc694\uc778\uc774 \ubc1c\uacac\ub418\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4."
+        )
+        purchase_advice = (
+            "\uc608\uc0b0, \ub9ac\ubdf0 \uc218, \ud3c9\uc810, \ubc18\ud488\ub960\uc744 \ub2e4\uc2dc \ud655\uc778\ud55c \ub4a4 \uad6c\ub9e4\ub97c \uacb0\uc815\ud558\ub294 \uac83\uc774 \uc88b\uc2b5\ub2c8\ub2e4. "
+            "\ud2b9\ud788 \uac00\uaca9\uc774 \ucd94\uc815\ub41c \uacbd\uc6b0 \uc2e4\uc81c \ud310\ub9e4\uac00\ub97c \ud655\uc778\ud574 \uc810\uc218\ub97c \ub2e4\uc2dc \uacc4\uc0b0\ud574\ubcf4\uc138\uc694."
+        )
+        alternative_strategy = (
+            f"\ub300\uccb4\uc0c1\ud488 \uc911 '{top_alternative.get('name')}'\uc744 \uba3c\uc800 \ube44\uad50\ud574\ubcf4\uc138\uc694. "
+            f"\uc608\uce21 \ud6c4\ud68c \uc810\uc218\ub294 {round(safe_float(top_alternative.get('regret_score')) * 100)}\uc810\uc785\ub2c8\ub2e4."
+            if top_alternative
+            else "\ud604\uc7ac \uc870\uac74\uc5d0\uc11c\ub294 \ucd94\ucc9c\ud560 \ub300\uccb4\uc0c1\ud488\uc774 \ucda9\ubd84\ud558\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4. \uc608\uc0b0\uc774\ub098 \uc120\ud638 \ube0c\ub79c\ub4dc\ub97c \uc785\ub825\ud558\uba74 \ucd94\ucc9c \ud488\uc9c8\uc774 \uc88b\uc544\uc9d1\ub2c8\ub2e4."
+        )
+
+        return {
+            "used_llm": False,
+            "summary": f"{product_name}\uc758 \uad6c\ub9e4 \ud6c4\ud68c \uac00\ub2a5\uc131\uc740 {percent}\uc810\uc73c\ub85c \ud3c9\uac00\ub429\ub2c8\ub2e4. {tone}.",
+            "risk_explanation": risk_explanation,
+            "purchase_advice": purchase_advice,
+            "alternative_strategy": alternative_strategy,
+        }
+
     def _summary(
         self,
         product: Dict[str, Any],
