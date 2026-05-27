@@ -7,7 +7,7 @@
  */
 import { useState } from "react";
 import { Link } from "wouter";
-import { ShoppingCart, RotateCcw, Wifi, WifiOff, ChevronRight, Sun, Moon, History } from "lucide-react";
+import { ShoppingCart, RotateCcw, Wifi, WifiOff, ChevronRight, Sun, Moon, History, CheckCircle2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useStopBuyWS } from "@/hooks/useStopBuyWS";
 import { ProductInputForm } from "@/components/ProductInputForm";
@@ -21,8 +21,20 @@ import { useTheme } from "@/contexts/ThemeContext";
 const HERO_BG = "https://d2xsxph8kpxj0f.cloudfront.net/310519663632451254/8SbY3RBNCHrKBA7jPh2CJe/stopbuy_hero-KnzLRbMywdJiHKwExzwAxg.webp";
 
 export default function Home() {
-  const { status, progress, progressMessage, result, error, isConnected, analyze, reset } =
-    useStopBuyWS();
+  const {
+    status,
+    progress,
+    progressMessage,
+    result,
+    error,
+    isConnected,
+    productCandidates,
+    candidateQuery,
+    extractedProduct,
+    analyze,
+    selectProductCandidate,
+    reset,
+  } = useStopBuyWS();
   const { theme, toggleTheme } = useTheme();
 
   const [activeResultTab, setActiveResultTab] = useState<"causes" | "alternatives" | "analysis">(
@@ -30,6 +42,7 @@ export default function Home() {
   );
 
   const isAnalyzing = status === "connecting" || status === "analyzing";
+  const isSelectingProduct = status === "selecting_product";
   const hasResult = status === "completed" && result;
   const hasError = status === "error";
   const isDark = theme === "dark";
@@ -186,10 +199,10 @@ export default function Home() {
 
       {/* ── 메인 콘텐츠 ── */}
       <main className="flex-1 container py-6">
-        <div className={`flex gap-6 ${hasResult || isAnalyzing || hasError ? "flex-col lg:flex-row" : "flex-col max-w-xl mx-auto"}`}>
+        <div className={`flex gap-6 ${hasResult || isAnalyzing || isSelectingProduct || hasError ? "flex-col lg:flex-row" : "flex-col max-w-xl mx-auto"}`}>
 
           {/* 왼쪽: 입력 패널 */}
-          <div className={hasResult || isAnalyzing || hasError ? "lg:w-[38%] shrink-0" : "w-full"}>
+          <div className={hasResult || isAnalyzing || isSelectingProduct || hasError ? "lg:w-[38%] shrink-0" : "w-full"}>
             <div
               className="glass-card rounded-2xl p-5"
             >
@@ -233,7 +246,7 @@ export default function Home() {
           </div>
 
           {/* 오른쪽: 결과 패널 */}
-          {(isAnalyzing || hasResult || hasError) && (
+          {(isAnalyzing || isSelectingProduct || hasResult || hasError) && (
             <div className="flex-1 min-w-0">
 
               {/* 분석 중 */}
@@ -244,6 +257,94 @@ export default function Home() {
               )}
 
               {/* 오류 */}
+
+
+              {/* product candidate selection */}
+              {isSelectingProduct && (
+                <div className="glass-card rounded-2xl p-5 flex flex-col gap-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3
+                        className="font-semibold text-base"
+                        style={{ color: "var(--sb-text-primary)", fontFamily: "'Space Grotesk', monospace" }}
+                      >
+                        {"\ub124\uc774\ubc84 \uc1fc\ud551 \uc0c1\ud488 \ud6c4\ubcf4"}
+                      </h3>
+                      <p className="text-xs mt-1" style={{ color: "var(--sb-text-muted)" }}>
+                        {"\uc774\ubbf8\uc9c0\uc5d0\uc11c \ucd94\uc815\ud55c \uc0c1\ud488\uacfc \uac00\uc7a5 \uac00\uae4c\uc6b4 \ud56d\ubaa9\uc744 \uc120\ud0dd\ud558\uba74 \ud574\ub2f9 \uc0c1\ud488\uc73c\ub85c \ud6c4\ud68c \uc608\uce21\uc744 \uc9c4\ud589\ud569\ub2c8\ub2e4."}
+                      </p>
+                    </div>
+                    {candidateQuery && (
+                      <span
+                        className="shrink-0 text-xs px-2.5 py-1 rounded-lg"
+                        style={{ background: "var(--sb-input-bg)", color: "var(--sb-text-dim)", border: "1px solid var(--sb-border)" }}
+                      >
+                        {candidateQuery}
+                      </span>
+                    )}
+                  </div>
+
+                  {extractedProduct?.name && (
+                    <div
+                      className="rounded-xl p-3 text-xs"
+                      style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)", color: "var(--sb-text-muted)" }}
+                    >
+                      {"\uc774\ubbf8\uc9c0 \ubd84\uc11d \uacb0\uacfc: "}<span style={{ color: "var(--sb-text-primary)" }}>{extractedProduct.name}</span>
+                    </div>
+                  )}
+
+                  {productCandidates.length > 0 ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+                      {productCandidates.map((candidate, index) => (
+                        <button
+                          key={candidate.product_id ?? `${candidate.name}-${index}`}
+                          type="button"
+                          onClick={() => selectProductCandidate(candidate)}
+                          className="group text-left rounded-xl overflow-hidden transition-all duration-150"
+                          style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
+                          onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--sb-blue)"; }}
+                          onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--sb-input-border)"; }}
+                        >
+                          <div className="aspect-square w-full overflow-hidden" style={{ background: "var(--sb-card-bg)" }}>
+                            {candidate.image_url ? (
+                              <img src={candidate.image_url} alt={candidate.name || "\uc0c1\ud488 \ud6c4\ubcf4"} className="w-full h-full object-cover" />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center" style={{ color: "var(--sb-text-dim)" }}>
+                                <ShoppingCart size={28} />
+                              </div>
+                            )}
+                          </div>
+                          <div className="p-3 flex flex-col gap-2">
+                            <div className="min-h-10">
+                              <p className="text-sm font-semibold line-clamp-2" style={{ color: "var(--sb-text-primary)" }}>
+                                {candidate.name || "\uc0c1\ud488\uba85 \ubbf8\ud655\uc778"}
+                              </p>
+                              <p className="text-xs mt-1 truncate" style={{ color: "var(--sb-text-dim)" }}>
+                                {[candidate.mall_name, candidate.brand, candidate.category].filter(Boolean).join(" \u00b7 ") || "\ub124\uc774\ubc84 \uc1fc\ud551"}
+                              </p>
+                            </div>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-bold text-sm" style={{ color: "var(--sb-blue-light)", fontFamily: "'Space Grotesk', monospace" }}>
+                                {candidate.price ? `${candidate.price.toLocaleString()}\uc6d0` : "\uac00\uaca9 \ubbf8\ud655\uc778"}
+                              </span>
+                              <span className="inline-flex items-center gap-1 text-xs font-medium" style={{ color: "var(--sb-green)" }}>
+                                <CheckCircle2 size={13} /> {"\uc120\ud0dd"}
+                              </span>
+                            </div>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <div
+                      className="rounded-xl p-6 text-center text-sm"
+                      style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)", color: "var(--sb-text-muted)" }}
+                    >
+                      {"\ub124\uc774\ubc84 \uc1fc\ud551\uc5d0\uc11c \uc720\uc0ac \uc0c1\ud488\uc744 \ucc3e\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4. \uc774\ubbf8\uc9c0\uac00 \uc120\uba85\ud55c\uc9c0 \ud655\uc778\ud55c \ub4a4 \ub2e4\uc2dc \uc2dc\ub3c4\ud574\uc8fc\uc138\uc694."}
+                    </div>
+                  )}
+                </div>
+              )}
               {hasError && (
                 <div
                   className="glass-card rounded-2xl p-6 flex flex-col items-center gap-4 text-center"

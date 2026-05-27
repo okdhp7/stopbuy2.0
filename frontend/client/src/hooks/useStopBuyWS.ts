@@ -12,7 +12,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 export type RegretLevel = "low" | "medium" | "high";
-export type AnalysisStatus = "idle" | "connecting" | "analyzing" | "completed" | "error";
+export type AnalysisStatus = "idle" | "connecting" | "analyzing" | "selecting_product" | "completed" | "error";
 
 export interface RegretCause {
   code: string;
@@ -20,6 +20,15 @@ export interface RegretCause {
   message: string;
   severity: "low" | "medium" | "high";
   impact_score: number;
+}
+
+export interface PreferenceAlignment {
+  adjustment?: number;
+  alignment_score?: number;
+  condition_similarity?: number;
+  matched_tokens?: string[];
+  matched_preferred_brand?: boolean;
+  reasons?: string[];
 }
 
 export interface AlternativeProduct {
@@ -36,6 +45,7 @@ export interface AlternativeProduct {
   final_score?: number;
   recommendation_reason?: string;
   image_url?: string;
+  preference_alignment?: PreferenceAlignment;
 }
 
 export interface LLMAnalysis {
@@ -52,6 +62,9 @@ export interface AnalysisResult {
   regret_level?: RegretLevel;
   model_regret_score?: number;
   cause_score?: number;
+  base_regret_score?: number;
+  preference_adjustment?: number;
+  preference_alignment?: PreferenceAlignment;
   threshold?: number;
   should_reconsider?: boolean;
   regret_causes?: RegretCause[];
@@ -78,6 +91,19 @@ export interface ProductInfo {
   return_rate?: number;
   days_since_release?: number;
   description?: string;
+  image_url?: string;
+  source_url?: string;
+  product_url?: string;
+  mall_name?: string;
+  naver_product_id?: string;
+  search_query?: string;
+  review_data_available?: boolean;
+  review_source?: string;
+  review_texts?: string[];
+}
+
+export interface ProductCandidate extends ProductInfo {
+  product_id?: number | string;
 }
 
 interface UseStopBuyWSOptions {
@@ -92,6 +118,9 @@ interface UseStopBuyWSReturn {
   error: string | null;
   sessionId: string;
   isConnected: boolean;
+  productCandidates: ProductCandidate[];
+  candidateQuery: string;
+  extractedProduct: ProductInfo | null;
   analyze: (params: {
     inputType: "url" | "image" | "manual";
     productUrl?: string;
@@ -99,6 +128,7 @@ interface UseStopBuyWSReturn {
     user?: UserProfile;
     product?: ProductInfo;
   }) => void;
+  selectProductCandidate: (candidate: ProductCandidate) => void;
   reset: () => void;
 }
 
@@ -300,9 +330,13 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [productCandidates, setProductCandidates] = useState<ProductCandidate[]>([]);
+  const [candidateQuery, setCandidateQuery] = useState("");
+  const [extractedProduct, setExtractedProduct] = useState<ProductInfo | null>(null);
   const [sessionId] = useState(() => generateSessionId());
 
   const wsRef = useRef<WebSocket | null>(null);
+  const lastUserRef = useRef<UserProfile | undefined>(undefined);
   const pendingRequestRef = useRef<{ type: string; session_id: string; data: object } | null>(null);
   const demoTimerRef = useRef<ReturnType<typeof setTimeout>[]>([]);
   const completionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -325,7 +359,7 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
 
   const handleMessage = useCallback((message: {
     type: string;
-    data?: AnalysisResult;
+    data?: any;
     progress?: number;
     message?: string;
     error?: string;
@@ -334,7 +368,19 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
     if (type === "progress") {
       setProgress(message.progress || 0);
       setProgressMessage(message.message || "분석 중...");
+    } else if (type === "product_candidates") {
+      const payload = message.data || {};
+      setProductCandidates(Array.isArray(payload.candidates) ? payload.candidates : []);
+      setCandidateQuery(payload.query || "");
+      setExtractedProduct(payload.extracted_product || null);
+      setResult(null);
+      setProgress(100);
+      setProgressMessage("??? ??? ??????.");
+      setStatus("selecting_product");
     } else if (type === "result") {
+      setProductCandidates([]);
+      setCandidateQuery("");
+      setExtractedProduct(null);
       setResult(message.data ? normalizeAgentResult(message.data) : null);
       setProgress(100);
       setProgressMessage("분석 완료!");
@@ -488,9 +534,13 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
       clearDemoTimers();
       clearCompletionTimer();
       setProgress(5);
-      setProgressMessage("서버에 연결 중...");
+      setProgressMessage("??? ?? ?...");
       setResult(null);
       setError(null);
+      setProductCandidates([]);
+      setCandidateQuery("");
+      setExtractedProduct(null);
+      lastUserRef.current = params.user;
       retryCountRef.current = 0;
 
       const requestMessage = {
@@ -505,18 +555,68 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
         },
       };
 
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify(requestMessage));
-        setStatus("analyzing");
-        setProgress(10);
-        setProgressMessage("분석 요청 전송 완료...");
-      } else {
-        pendingRequestRef.current = requestMessage;
-        connect();
+      const activeSocket = wsRef.current;
+      if (activeSocket?.readyState === WebSocket.OPEN) {
+        try {
+          activeSocket.send(JSON.stringify(requestMessage));
+          setStatus("analyzing");
+          setProgress(10);
+          setProgressMessage("\ubd84\uc11d \uc694\uccad \uc804\uc1a1 \uc644\ub8cc...");
+          return;
+        } catch (err) {
+          console.error("WebSocket send failed, reconnecting:", err);
+          activeSocket.close();
+          wsRef.current = null;
+        }
       }
+
+      pendingRequestRef.current = requestMessage;
+      connect();
     },
     [sessionId, connect, clearDemoTimers, clearCompletionTimer]
   );
+
+
+  const selectProductCandidate = useCallback(
+    (candidate: ProductCandidate) => {
+      const selectedProduct: ProductInfo = {
+        name: candidate.name,
+        brand: candidate.brand,
+        category: candidate.category,
+        price: candidate.price,
+        rating: candidate.rating,
+        review_count: candidate.review_count,
+        return_rate: candidate.return_rate,
+        description: candidate.description,
+        image_url: candidate.image_url,
+        source_url: candidate.source_url || candidate.product_url,
+        product_url: candidate.product_url || candidate.source_url,
+        mall_name: candidate.mall_name,
+        naver_product_id: candidate.naver_product_id,
+        search_query: candidate.search_query,
+        review_data_available: candidate.review_data_available,
+        review_source: candidate.review_source,
+        review_texts: candidate.review_texts,
+      };
+
+      setProductCandidates([]);
+      setCandidateQuery("");
+      setExtractedProduct(null);
+      setResult(null);
+      setError(null);
+      setStatus("connecting");
+      setProgress(5);
+      setProgressMessage("\uc120\ud0dd\ud55c \uc0c1\ud488\uc73c\ub85c \ubd84\uc11d\uc744 \uc900\ube44\ud558\uace0 \uc788\uc2b5\ub2c8\ub2e4.");
+
+      analyze({
+        inputType: "manual",
+        user: lastUserRef.current,
+        product: selectedProduct,
+      });
+    },
+    [analyze]
+  );
+
 
   const reset = useCallback(() => {
     clearDemoTimers();
@@ -526,6 +626,9 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
     setProgressMessage("");
     setResult(null);
     setError(null);
+    setProductCandidates([]);
+    setCandidateQuery("");
+    setExtractedProduct(null);
     retryCountRef.current = 0;
   }, [clearDemoTimers, clearCompletionTimer]);
 
@@ -545,7 +648,11 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
     error,
     sessionId,
     isConnected,
+    productCandidates,
+    candidateQuery,
+    extractedProduct,
     analyze,
+    selectProductCandidate,
     reset,
   };
 }

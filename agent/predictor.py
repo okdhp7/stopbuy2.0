@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import json
 import math
 import os
@@ -42,6 +42,11 @@ TRAINING_COLUMNS = NUMERIC_COLUMNS + CATEGORICAL_COLUMNS
 
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "regret_model.pkl"
 DEFAULT_DATASET_PATH = Path(__file__).resolve().parents[1] / "datas" / "purchase_regret_training_dataset_1500.xlsx"
+DEFAULT_OPTIONS_PATH = Path(__file__).resolve().parent / "agent_options.json"
+DEFAULT_AGENT_OPTIONS = {
+    "alternative_regret_score_threshold": 30,
+    "max_alternative_products": 5,
+}
 
 PRODUCT_IMAGE_URLS = {
     "galaxy s24 fe": "https://fdn2.gsmarena.com/vv/bigpic/samsung-galaxy-s24-fe.jpg",
@@ -60,6 +65,40 @@ PRODUCT_IMAGE_URLS = {
 
 
 ## 구매후회값을 0~1 범위로 예측하는 PyTorch 회귀 신경망입니다.
+## Load recommendation options from agent_options.json, falling back to defaults.
+def load_agent_options(
+    path: Path = DEFAULT_OPTIONS_PATH,
+) -> Dict[str, Any]:
+    options = dict(DEFAULT_AGENT_OPTIONS)
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                options.update(loaded)
+        except Exception as exc:
+            warnings.warn(f"Failed to load agent options from {path}: {exc}")
+    return options
+
+
+## Convert a 0~100 threshold option into the model's 0.0~1.0 score range.
+def normalize_option_threshold(
+    value: Any,
+    default: float,
+) -> float:
+    parsed = safe_float(value, default)
+    if parsed > 1.0:
+        parsed = parsed / 100.0
+    return max(0.0, min(1.0, parsed))
+
+
+## Convert option values to a non-negative integer count.
+def normalize_option_count(
+    value: Any,
+    default: int,
+) -> int:
+    return max(0, safe_int(value, default))
+
+
 class RegretTorchRegressor(nn.Module):
 
     ## 입력 피처 차원에 맞춰 회귀 신경망 계층을 구성합니다.
@@ -271,18 +310,71 @@ def build_training_row(
 
 
 ## 예산, 평점, 반품률, 리뷰 수 등을 바탕으로 후회 원인 목록을 생성합니다.
+
+## Normalize a user input value into a readable list for cause messages.
+def normalize_user_input_list(
+    value: Any,
+) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        values = value
+    else:
+        values = re.split(r"[,/|\n\t]+", str(value))
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+## Detect explicit risk words in product name, category, and description.
+def detect_product_risk_keywords(
+    product: Dict[str, Any],
+) -> List[str]:
+    text = product_preference_text(product).lower()
+    keyword_groups = {
+        "\uc911\uace0": ["\uc911\uace0", "used", "secondhand"],
+        "\ub9ac\ud37c": ["\ub9ac\ud37c", "\ub9ac\ud37c\ube44\uc2dc", "refurb", "refurbished"],
+        "\ud638\ud658\ud488": ["\ud638\ud658", "compatible", "replacement"],
+        "\ubd80\ud488": ["\ubd80\ud488", "parts", "part only"],
+        "\ubc8c\ud06c": ["\ubc8c\ud06c", "bulk"],
+        "\ud574\uc678\uc9c1\uad6c": ["\ud574\uc678\uc9c1\uad6c", "\uc9c1\uad6c", "import", "\uad6c\ub9e4\ub300\ud589"],
+    }
+    found: List[str] = []
+    for label, keywords in keyword_groups.items():
+        if any(keyword.lower() in text for keyword in keywords):
+            found.append(label)
+    return found
+
+
+## Detect negative signals from collected review text samples.
+def detect_negative_review_signals(
+    product: Dict[str, Any],
+) -> List[str]:
+    review_texts = product.get("review_texts") or []
+    if not isinstance(review_texts, list):
+        return []
+    negative_keywords = {
+        "\ubd88\ub7c9", "\uace0\uc7a5", "\ud30c\uc190", "\ubc18\ud488", "\ud658\ubd88", "\uc2e4\ub9dd", "\ubcc4\ub85c", "\ucd5c\uc545", "\ub290\ub9bc", "\uc18c\uc74c", "\ub0c4\uc0c8",
+        "defect", "broken", "refund", "return", "disappointed", "bad", "worst", "noise",
+    }
+    joined = " ".join(str(text).lower() for text in review_texts)
+    found = [keyword for keyword in negative_keywords if keyword.lower() in joined]
+    return sorted(found)[:5]
+
 def make_regret_causes(
     model_score: float,
     user: Dict[str, Any],
     product: Dict[str, Any],
+    alignment: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     causes: List[Dict[str, Any]] = []
     budget = safe_float(user.get("budget"))
     price = safe_float(product.get("price"))
     price_estimated = bool(product.get("price_estimated"))
     rating = safe_float(product.get("rating"), 3.5)
+    rating_missing = bool(product.get("rating_missing"))
     return_rate = safe_float(product.get("return_rate"), 5.0)
     review_count = safe_int(product.get("review_count"))
+    review_data_available = bool(product.get("review_data_available"))
+    alignment = alignment or {}
 
     if product.get("price_estimated"):
         causes.append({
@@ -302,7 +394,7 @@ def make_regret_causes(
             "severity": "high" if over_ratio >= 0.3 else "medium",
             "impact_score": round(min(over_ratio, 1.0), 4),
         })
-    if rating < 3.8:
+    if not rating_missing and rating < 3.8:
         causes.append({
             "code": "LOW_RATING",
             "title": "낮은 사용자 평점",
@@ -318,14 +410,72 @@ def make_regret_causes(
             "severity": "high" if return_rate >= 15 else "medium",
             "impact_score": round(min(return_rate / 30, 1.0), 4),
         })
-    if review_count < 20:
+    if not review_data_available:
+        causes.append({
+            "code": "REVIEW_DATA_MISSING",
+            "title": "\ud3c9\uac00\uc815\ubcf4 \ubd80\uc871",
+            "message": "\ud3c9\uc810\uacfc \ud6c4\uae30\uac1c\uc218\ub97c \ud655\uc778\ud558\uc9c0 \ubabb\ud574 \uc2e4\uc81c \ub9cc\uc871\ub3c4 \uac80\uc99d\uc774 \ubd80\uc871\ud569\ub2c8\ub2e4.",
+            "severity": "medium",
+            "impact_score": 0.38,
+        })
+    elif review_count < 20:
         causes.append({
             "code": "LOW_REVIEW_COUNT",
-            "title": "검증 부족",
-            "message": "리뷰 수가 적어 신뢰도와 만족도에 대한 검증이 충분하지 않습니다.",
+            "title": "?? ??",
+            "message": "?? ?? ?? ???? ???? ?? ??? ???? ????.",
             "severity": "medium",
             "impact_score": 0.35,
         })
+    preferred_brands = normalize_user_input_list(user.get("preferred_brands"))
+    if preferred_brands and not alignment.get("matched_preferred_brand"):
+        causes.append({
+            "code": "PREFERRED_BRAND_MISMATCH",
+            "title": "\uc120\ud638\ube0c\ub79c\ub4dc \ubd88\uc77c\uce58",
+            "message": f"\uc785\ub825\ud55c \uc120\ud638\ube0c\ub79c\ub4dc({', '.join(preferred_brands[:3])})\uc640 \ub300\uc0c1 \uc0c1\ud488 \ube0c\ub79c\ub4dc\uac00 \ucda9\ubd84\ud788 \uc77c\uce58\ud558\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4.",
+            "severity": "medium",
+            "impact_score": 0.24,
+        })
+
+    important_factors = normalize_user_input_list(user.get("important_factors"))
+    purpose = str(user.get("usage_purpose") or "").strip()
+    condition_similarity = safe_float(alignment.get("condition_similarity"))
+    if important_factors and condition_similarity < 0.18:
+        causes.append({
+            "code": "IMPORTANT_FACTOR_MISMATCH",
+            "title": "\uc911\uc694\uc694\uc18c \ubd88\uc77c\uce58",
+            "message": f"\uc911\uc694\ud558\uac8c \uc785\ub825\ud55c \uc694\uc18c({', '.join(important_factors[:3])})\uac00 \uc0c1\ud488\uba85/\ube0c\ub79c\ub4dc/\uce74\ud14c\uace0\ub9ac/\uc124\uba85\uc5d0\uc11c \ucda9\ubd84\ud788 \ud655\uc778\ub418\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4.",
+            "severity": "medium",
+            "impact_score": 0.26,
+        })
+    if purpose and condition_similarity < 0.18:
+        causes.append({
+            "code": "PURPOSE_MISMATCH",
+            "title": "\uc0ac\uc6a9\ubaa9\uc801 \uc801\ud569\ub3c4 \ub0ae\uc74c",
+            "message": f"\uc0ac\uc6a9\ubaa9\uc801({purpose[:40]})\uacfc \uc0c1\ud488 \uc815\ubcf4\uc758 \uc5f0\uad00\uc131\uc774 \ub0ae\uc544 \uc2e4\uc81c \uc0ac\uc6a9 \ud6c4 \ubd88\ub9cc\uc774 \uc0dd\uae38 \uc218 \uc788\uc2b5\ub2c8\ub2e4.",
+            "severity": "medium",
+            "impact_score": 0.25,
+        })
+
+    risk_keywords = detect_product_risk_keywords(product)
+    if risk_keywords:
+        causes.append({
+            "code": "RISK_KEYWORD_USED",
+            "title": "\uc0c1\ud488\uba85 \uc704\ud5d8 \ud0a4\uc6cc\ub4dc",
+            "message": f"\uc0c1\ud488 \uc815\ubcf4\uc5d0 {', '.join(risk_keywords)} \ud45c\ud604\uc774 \ud3ec\ud568\ub418\uc5b4 \uad6c\ub9e4 \uc804 \uc0c1\ud0dc\uc640 \uc870\uac74\uc744 \ub354 \ud655\uc778\ud574\uc57c \ud569\ub2c8\ub2e4.",
+            "severity": "high" if any(keyword in risk_keywords for keyword in ["\uc911\uace0", "\ub9ac\ud37c", "\ubd80\ud488"]) else "medium",
+            "impact_score": 0.42,
+        })
+
+    negative_reviews = detect_negative_review_signals(product)
+    if negative_reviews:
+        causes.append({
+            "code": "REVIEW_NEGATIVE_SIGNAL",
+            "title": "\ub9ac\ubdf0 \ubd80\uc815 \uc2e0\ud638",
+            "message": f"\uc218\uc9d1\ub41c \ub9ac\ubdf0 \uc0d8\ud50c\uc5d0\uc11c {', '.join(negative_reviews)} \uad00\ub828 \ud45c\ud604\uc774 \uac10\uc9c0\ub418\uc5c8\uc2b5\ub2c8\ub2e4.",
+            "severity": "medium",
+            "impact_score": 0.32,
+        })
+
     if model_score >= 0.4 and not causes:
         causes.append({
             "code": "MODEL_HIGH_RISK",
@@ -346,6 +496,139 @@ def make_regret_causes(
 
 
 ## 모델이 과소평가할 수 있는 명시적 위험요인을 규칙 기반 점수로 계산합니다.
+
+## Tokenize user preference and product text for lightweight similarity scoring.
+def tokenize_preference_text(
+    *values: Any,
+) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            tokens.update(tokenize_preference_text(*value))
+            continue
+        text = str(value).lower()
+        for separator in [",", "/", "|", "&", "?", "?", "\\", "\n", "\t"]:
+            text = text.replace(separator, " ")
+        raw_tokens = [token.strip() for token in text.split() if token.strip()]
+        tokens.update(raw_tokens)
+        compact = "".join(raw_tokens)
+        if compact:
+            tokens.add(compact)
+    aliases = {
+        "apple": ["iphone", "airpods", "macbook", "\uc560\ud50c"],
+        "samsung": ["galaxy", "buds", "\uc0bc\uc131"],
+        "sony": ["wh-1000xm", "headphone", "\uc18c\ub2c8"],
+        "price": ["budget", "cheap", "value", "\uac00\uaca9", "\uc608\uc0b0", "\uac00\uc131\ube44", "\uc800\ub834"],
+        "quality": ["rating", "performance", "premium", "\ud488\uc9c8", "\ud3c9\uc810", "\uc131\ub2a5", "\uc644\uc131\ub3c4"],
+        "portable": ["light", "battery", "mobile", "\ud734\ub300", "\uac00\ubcbc\uc6c0", "\ubc30\ud130\ub9ac"],
+        "work": ["office", "business", "productivity", "\uc5c5\ubb34", "\uc0ac\ubb34", "\ubb38\uc11c"],
+        "game": ["gaming", "performance", "display", "\uac8c\uc784", "\uace0\uc131\ub2a5"],
+        "study": ["education", "lecture", "reading", "\uacf5\ubd80", "\uac15\uc758", "\ud559\uc2b5"],
+        "travel": ["trip", "portable", "battery", "\uc5ec\ud589", "\ud734\ub300"],
+        "stable": ["return", "durable", "reliable", "\uc548\uc815", "\ub0b4\uad6c", "\ubc18\ud488"],
+    }
+    expanded = set(tokens)
+    for canonical, words in aliases.items():
+        if canonical in tokens or any(word in tokens for word in words):
+            expanded.add(canonical)
+            expanded.update(words)
+    return expanded
+
+
+## Build searchable text from product fields for preference similarity scoring.
+def product_preference_text(
+    product: Dict[str, Any],
+) -> str:
+    return " ".join(
+        str(product.get(key) or "")
+        for key in ["name", "brand", "category", "description"]
+    )
+
+
+## Calculate how well a product matches user brand, factor, and purpose preferences.
+def preference_alignment(
+    user: Dict[str, Any],
+    product: Dict[str, Any],
+) -> Dict[str, Any]:
+    product_text = product_preference_text(product)
+    product_tokens = tokenize_preference_text(product_text)
+    brand_tokens = tokenize_preference_text(product.get("brand"), product.get("name"))
+    preferred_tokens = tokenize_preference_text(user.get("preferred_brands"))
+    factor_tokens = tokenize_preference_text(user.get("important_factors"))
+    purpose_tokens = tokenize_preference_text(user.get("usage_purpose"))
+    budget_factor_tokens = {"price", "budget", "cheap", "value", "\uac00\uaca9", "\uc608\uc0b0", "\uac00\uc131\ube44", "\uc800\ub834"}
+    condition_tokens = (factor_tokens - budget_factor_tokens) | purpose_tokens
+
+    matched_preferred = bool(preferred_tokens & brand_tokens)
+    condition_matches = condition_tokens & product_tokens
+    condition_similarity = (
+        len(condition_matches) / max(len(condition_tokens), 1)
+        if condition_tokens
+        else 0.0
+    )
+
+    price = safe_float(product.get("price"))
+    budget = safe_float(user.get("budget"))
+    rating = safe_float(product.get("rating"), 3.5)
+    return_rate = safe_float(product.get("return_rate"), 5.0)
+
+    adjustment = 0.0
+    reasons: List[str] = []
+    if preferred_tokens:
+        if matched_preferred:
+            adjustment -= 0.04
+            reasons.append("preferred_brand_match")
+        else:
+            adjustment += 0.02
+            reasons.append("preferred_brand_mismatch")
+
+    if condition_similarity >= 0.18:
+        adjustment -= min(condition_similarity * 0.08, 0.06)
+        reasons.append("condition_text_match")
+    elif condition_tokens:
+        adjustment += 0.03
+        reasons.append("condition_text_mismatch")
+
+    if factor_tokens & budget_factor_tokens:
+        if budget > 0 and price > budget:
+            over_ratio = (price - budget) / budget
+            adjustment += min(0.04 + math.log1p(over_ratio) * 0.035, 0.24)
+            reasons.append("price_factor_over_budget")
+        elif budget > 0 and price <= budget:
+            under_ratio = (budget - price) / max(budget, 1.0)
+            adjustment -= min(0.04 + under_ratio * 0.04, 0.08)
+            reasons.append("price_factor_in_budget")
+
+    if factor_tokens & {"quality", "rating", "performance", "\ud488\uc9c8", "\ud3c9\uc810", "\uc131\ub2a5", "\uc644\uc131\ub3c4"}:
+        if rating >= 4.3:
+            adjustment -= 0.035
+            reasons.append("quality_factor_good_rating")
+        elif rating < 4.0:
+            adjustment += 0.05
+            reasons.append("quality_factor_low_rating")
+
+    if factor_tokens & {"stable", "return", "durable", "\uc548\uc815", "\ub0b4\uad6c", "\ubc18\ud488"}:
+        if return_rate <= 5:
+            adjustment -= 0.03
+            reasons.append("stability_factor_low_return")
+        elif return_rate >= 10:
+            adjustment += 0.06
+            reasons.append("stability_factor_high_return")
+
+    adjustment = max(-0.14, min(0.24, adjustment))
+    alignment_score = max(0.0, min(1.0, 0.5 - adjustment * 2.5))
+    return {
+        "adjustment": adjustment,
+        "alignment_score": alignment_score,
+        "condition_similarity": round(condition_similarity, 4),
+        "matched_tokens": sorted(condition_matches),
+        "matched_preferred_brand": matched_preferred,
+        "reasons": reasons,
+    }
+
+
 def explicit_risk_score(
     user: Dict[str, Any],
     product: Dict[str, Any],
@@ -354,24 +637,32 @@ def explicit_risk_score(
     price = safe_float(product.get("price"))
     price_estimated = bool(product.get("price_estimated"))
     rating = safe_float(product.get("rating"), 3.5)
+    rating_missing = bool(product.get("rating_missing"))
     return_rate = safe_float(product.get("return_rate"), 5.0)
     review_count = safe_int(product.get("review_count"))
+    review_data_available = bool(product.get("review_data_available"))
 
     score = 0.0
     if budget > 0 and price > budget:
         over_ratio = (price - budget) / budget
-        score += min(over_ratio / 2.0, 1.0) * 0.42
+        score += min(0.12 + math.log1p(over_ratio) * 0.09, 0.78)
     elif budget > 0 and price > budget * 0.85:
-        score += 0.12
+        near_ratio = (price - budget * 0.85) / max(budget * 0.15, 1.0)
+        score += 0.06 + near_ratio * 0.08
+    elif budget > 0 and price <= budget:
+        under_ratio = (budget - price) / max(budget, 1.0)
+        score -= min(under_ratio * 0.08, 0.08)
 
-    if rating < 4.2:
+    if not rating_missing and rating < 4.2:
         score += min((4.2 - rating) / 2.2, 1.0) * 0.2
     if return_rate > 5:
         score += min((return_rate - 5) / 25.0, 1.0) * 0.22
-    if review_count < 30:
+    if not review_data_available:
+        score += 0.12
+    elif review_count < 30:
         score += ((30 - max(review_count, 0)) / 30.0) * 0.16
 
-    if price >= 1_000_000 and (return_rate >= 10 or rating < 3.8):
+    if price >= 1_000_000 and (return_rate >= 10 or (not rating_missing and rating < 3.8)):
         score += 0.1
     if price_estimated:
         score += 0.18
@@ -672,11 +963,18 @@ class PurchaseRegretModel:
                 loaded = joblib.load(self.model_path)
             has_version_warning = any(issubclass(item.category, InconsistentVersionWarning) for item in caught_warnings)
             has_manual_preprocessor = isinstance(loaded, dict) and isinstance(loaded.get("preprocessor"), dict) and loaded["preprocessor"].get("type") == "manual_v1"
+            preprocessor = loaded.get("preprocessor") if isinstance(loaded, dict) else {}
+            has_required_features = (
+                has_manual_preprocessor
+                and all(column in preprocessor.get("numeric_stats", {}) for column in NUMERIC_COLUMNS)
+                and all(column in preprocessor.get("categorical_values", {}) for column in CATEGORICAL_COLUMNS)
+                and int(loaded.get("input_dim", 0)) == int(preprocessor.get("input_dim", -1))
+            )
             if (
                 isinstance(loaded, dict)
                 and "model_state" in loaded
                 and "preprocessor" in loaded
-                and has_manual_preprocessor
+                and has_required_features
                 and not has_version_warning
             ):
                 return loaded
@@ -715,8 +1013,20 @@ class RegretPredictor:
         model_path: Optional[str] = None,
         dataset_path: Optional[str] = None,
         threshold: float = 0.4,
+        options_path: Optional[str] = None,
     ):
-        self.threshold = threshold
+        self.options_path = Path(
+            options_path or os.getenv("AGENT_OPTIONS_PATH") or DEFAULT_OPTIONS_PATH
+        )
+        self.options = load_agent_options(self.options_path)
+        self.threshold = normalize_option_threshold(
+            self.options.get("alternative_regret_score_threshold"),
+            threshold,
+        )
+        self.max_alternative_products = normalize_option_count(
+            self.options.get("max_alternative_products"),
+            DEFAULT_AGENT_OPTIONS["max_alternative_products"],
+        )
         self.model_path = Path(model_path) if model_path else DEFAULT_MODEL_PATH
         self.dataset_path = Path(dataset_path) if dataset_path else DEFAULT_DATASET_PATH
         self.model = PurchaseRegretModel(self.model_path, self.dataset_path)
@@ -731,12 +1041,17 @@ class RegretPredictor:
         row = build_training_row(user, product)
         model_score = self.model.predict_row(row)
         rule_score = explicit_risk_score(user, product)
-        regret_score = calibrate_regret_score(model_score, rule_score)
-        causes = make_regret_causes(regret_score, user, product)
+        base_regret_score = calibrate_regret_score(model_score, rule_score)
+        alignment = preference_alignment(user, product)
+        regret_score = clamp_score(base_regret_score + alignment["adjustment"])
+        causes = make_regret_causes(regret_score, user, product, alignment)
         return {
             "feature": row,
             "model_regret_score": model_score,
             "cause_score": rule_score,
+            "base_regret_score": base_regret_score,
+            "preference_adjustment": alignment["adjustment"],
+            "preference_alignment": alignment,
             "regret_score": regret_score,
             "regret_causes": causes,
         }
@@ -750,14 +1065,22 @@ class RegretPredictor:
         raw_price = safe_float(product.get("price"))
         price_estimated = raw_price <= 0
         normalized_price = estimate_missing_price(product) if price_estimated else raw_price
+        rating_missing = product.get("rating") in (None, "")
+        review_count_missing = product.get("review_count") in (None, "")
+        review_data_available = bool(product.get("review_data_available"))
         normalized_product = {
-            "name": product.get("name") or "분석 대상 상품",
+            "name": product.get("name") or "?? ?? ??",
             "brand": product.get("brand"),
             "category": product.get("category"),
             "price": normalized_price,
             "price_estimated": price_estimated,
             "rating": safe_float(product.get("rating"), 3.5),
+            "rating_missing": rating_missing,
             "review_count": safe_int(product.get("review_count")),
+            "review_count_missing": review_count_missing,
+            "review_data_available": review_data_available,
+            "review_texts": product.get("review_texts") or [],
+            "review_source": product.get("review_source"),
             "return_rate": safe_float(product.get("return_rate"), 5.0),
             "days_since_release": safe_int(product.get("days_since_release"), 180),
             "description": product.get("description"),
@@ -777,7 +1100,12 @@ class RegretPredictor:
             "regret_level": regret_level(regret_score),
             "model_regret_score": round(score_result["model_regret_score"], 4),
             "cause_score": round(score_result["cause_score"], 4),
+            "base_regret_score": round(score_result["base_regret_score"], 4),
+            "preference_adjustment": round(score_result["preference_adjustment"], 4),
+            "preference_alignment": score_result["preference_alignment"],
             "threshold": self.threshold,
+            "max_alternative_products": self.max_alternative_products,
+            "agent_options": self.options,
             "should_reconsider": regret_score >= self.threshold,
             "regret_causes": score_result["regret_causes"],
             "regret_reasons": [cause["message"] for cause in score_result["regret_causes"]],
@@ -806,7 +1134,7 @@ class RegretPredictor:
         candidates = self.catalog.products
         if target_category:
             same_category = [item for item in candidates if normalize_category(item.get("category")) == target_category]
-            if len(same_category) >= 5:
+            if len(same_category) >= self.max_alternative_products:
                 candidates = same_category
 
         results = []
@@ -819,7 +1147,9 @@ class RegretPredictor:
             match_score = self._match_score(user, candidate, target_price)
             improvement = max(target_score - score, 0)
             price_score = self._price_advantage(candidate, target_price, budget)
-            final_score = match_score * 0.55 + improvement * 0.35 + price_score * 0.10
+            alignment = preference_alignment(user, candidate)
+            preference_score = safe_float(alignment.get("alignment_score"), 0.5)
+            final_score = match_score * 0.45 + improvement * 0.30 + price_score * 0.10 + preference_score * 0.15
             results.append({
                 "product_id": candidate.get("product_id"),
                 "name": candidate.get("name"),
@@ -833,10 +1163,11 @@ class RegretPredictor:
                 "match_score": round(match_score, 4),
                 "improvement_score": round(improvement, 4),
                 "final_score": round(final_score, 4),
+                "preference_alignment": alignment,
                 "recommendation_reason": self._recommendation_reason(user, candidate, product, score, target_score),
             })
         results.sort(key=lambda item: (-item["final_score"], item["regret_score"], item["price"]))
-        return results[:5]
+        return results[:self.max_alternative_products]
 
     ## 예산, 선호 브랜드, 평점, 반품률, 가격 이점을 종합한 추천 적합도를 계산합니다.
     def _match_score(

@@ -220,7 +220,7 @@ async def relay_to_agent(frontend_ws: WebSocket, session_id: str, payload: Dict[
                     raise
                 log_agent_payload("receive", message)
                 await send_json(frontend_ws, message)
-                if message.get("type") in ("result", "error"):
+                if message.get("type") in ("result", "error", "product_candidates"):
                     break
     except Exception as exc:
         logger.warning("agent relay failed: %s", exc)

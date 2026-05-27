@@ -11,7 +11,7 @@ from env_loader import load_dotenv
 
 load_dotenv()
 
-from product_extractor import extract_product_info
+from product_extractor import extract_product_candidates_from_image, extract_product_info
 from predictor import RegretPredictor
 
 
@@ -79,17 +79,28 @@ async def send_progress(ws: ServerConnection, session_id: str, progress: int, me
 
 async def handle_request(ws: ServerConnection, session_id: str, data: Dict[str, Any]) -> None:
     try:
-        await send_progress(ws, session_id, 25, "상품 정보를 추출하고 있습니다.")
+        if data.get("input_type") == "image" and not data.get("product"):
+            await send_progress(ws, session_id, 25, "\uc774\ubbf8\uc9c0\uc5d0\uc11c \uc0c1\ud488 \uc815\ubcf4\ub97c \ucd94\ucd9c\ud558\uace0 \uc788\uc2b5\ub2c8\ub2e4.")
+            candidate_result = await extract_product_candidates_from_image(data)
+            await send_progress(ws, session_id, 70, "\ub124\uc774\ubc84 \uc1fc\ud551\uc5d0\uc11c \uc720\uc0ac \uc0c1\ud488\uc744 \uac80\uc0c9\ud558\uace0 \uc788\uc2b5\ub2c8\ub2e4.")
+            await send_message(ws, {
+                "type": "product_candidates",
+                "session_id": session_id,
+                "data": candidate_result,
+            })
+            return
+
+        await send_progress(ws, session_id, 25, "\uc0c1\ud488 \uc815\ubcf4\ub97c \ucd94\ucd9c\ud558\uace0 \uc788\uc2b5\ub2c8\ub2e4.")
         product = await extract_product_info(data)
 
-        await send_progress(ws, session_id, 55, "구매 후회 가능성을 예측하고 있습니다.")
+        await send_progress(ws, session_id, 55, "\uad6c\ub9e4 \ud6c4\ud68c \uac00\ub2a5\uc131\uc744 \uc608\uce21\ud558\uace0 \uc788\uc2b5\ub2c8\ub2e4.")
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
             lambda: predictor.predict(user=data.get("user") or {}, product=product),
         )
 
-        await send_progress(ws, session_id, 85, "대체상품 추천 결과를 정리하고 있습니다.")
+        await send_progress(ws, session_id, 85, "\ub300\uccb4\uc0c1\ud488 \ucd94\ucc9c \uacb0\uacfc\ub97c \uc815\ub9ac\ud558\uace0 \uc788\uc2b5\ub2c8\ub2e4.")
         await asyncio.sleep(0.2)
         await send_message(ws, {
             "type": "result",
@@ -101,7 +112,7 @@ async def handle_request(ws: ServerConnection, session_id: str, data: Dict[str, 
         await send_message(ws, {
             "type": "error",
             "session_id": session_id,
-            "message": f"Agent 분석 중 오류가 발생했습니다: {exc}",
+            "message": f"Agent ?? ? ??? ??????: {exc}",
         })
 
 
