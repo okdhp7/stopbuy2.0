@@ -11,6 +11,7 @@ import { ShoppingCart, RotateCcw, Wifi, WifiOff, ChevronRight, Sun, Moon, Histor
 import { Button } from "@/components/ui/button";
 import { useStopBuyWS } from "@/hooks/useStopBuyWS";
 import { ProductInputForm } from "@/components/ProductInputForm";
+import { StopBuyLogo } from "@/components/StopBuyLogo";
 import { AnalysisProgress } from "@/components/AnalysisProgress";
 import { RegretGauge } from "@/components/RegretGauge";
 import { RegretCauseList } from "@/components/RegretCauseList";
@@ -68,12 +69,7 @@ export default function Home() {
       >
         {/* 로고 */}
         <div className="flex items-center gap-2.5">
-          <div
-            className="w-8 h-8 rounded-lg flex items-center justify-center"
-            style={{ background: "linear-gradient(135deg, var(--sb-blue), var(--sb-blue-dark))" }}
-          >
-            <ShoppingCart size={16} style={{ color: isDark ? "#0A0E1A" : "#fff" }} />
-          </div>
+          <StopBuyLogo size={32} cartSize={16} isDark={isDark} />
           <div>
             <span
               className="font-bold text-lg leading-none"

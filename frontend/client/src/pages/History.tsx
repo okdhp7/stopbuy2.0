@@ -6,13 +6,14 @@
 import { useState, useEffect, useCallback } from "react";
 import { Link } from "wouter";
 import {
-  ShoppingCart, ArrowLeft, RefreshCw, Clock, TrendingUp,
+  ArrowLeft, RefreshCw, Clock, TrendingUp,
   TrendingDown, AlertTriangle, CheckCircle, XCircle,
   ChevronRight, Sun, Moon, BarChart2, Package, Search
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useTheme } from "@/contexts/ThemeContext";
+import { StopBuyLogo } from "@/components/StopBuyLogo";
 
 // ── 타입 정의 ──────────────────────────────────────────────────────────────
 interface HistoryItem {
@@ -403,12 +404,7 @@ export default function History() {
             style={{ background: "var(--sb-border)" }}
           />
           <div className="flex items-center gap-2">
-            <div
-              className="w-7 h-7 rounded-lg flex items-center justify-center"
-              style={{ background: "linear-gradient(135deg, var(--sb-blue), var(--sb-blue-dark))" }}
-            >
-              <ShoppingCart size={13} style={{ color: isDark ? "#0A0E1A" : "#fff" }} />
-            </div>
+            <StopBuyLogo size={28} cartSize={13} isDark={isDark} />
             <span
               className="font-bold text-base"
               style={{ fontFamily: "'Space Grotesk', monospace", color: "var(--sb-text-primary)" }}

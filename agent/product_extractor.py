@@ -285,7 +285,7 @@ def build_image_search_query(
         product.get("category"),
     ]
     query = " ".join(str(value).strip() for value in candidates if value)
-    generic_words = {"\uc774\ubbf8\uc9c0", "\uc785\ub825", "\uc0c1\ud488", "image", "product", "unknown", "null"}
+    generic_words = {"이미지", "입력", "상품", "image", "product", "unknown", "null"}
     tokens = [token for token in re.split(r"\s+", query) if token and token.lower() not in generic_words]
     if tokens:
         return " ".join(tokens[:8])
@@ -317,11 +317,16 @@ def normalize_naver_shopping_item(
         None,
     )
     brand = clean_shopping_text(item.get("brand") or item.get("maker"))
-    name = clean_shopping_text(item.get("title")) or "\ub124\uc774\ubc84 \uc1fc\ud551 \uc0c1\ud488"
+    name = clean_shopping_text(item.get("title")) or "네이버 쇼핑 상품"
+    link = item.get("link")
+    catalog_match = re.search(r"/catalog/(\d+)", str(link or ""))
+    catalog_id = catalog_match.group(1) if catalog_match else None
 
     return {
         "product_id": f"naver-{item.get('productId') or index}",
         "naver_product_id": item.get("productId"),
+        "naver_product_type": item.get("productType"),
+        "naver_catalog_id": catalog_id,
         "name": name,
         "brand": brand,
         "category": category,
@@ -333,11 +338,11 @@ def normalize_naver_shopping_item(
         "review_source": None,
         "review_texts": [],
         "image_url": item.get("image"),
-        "source_url": item.get("link"),
-        "product_url": item.get("link"),
+        "source_url": link,
+        "product_url": link,
         "mall_name": clean_shopping_text(item.get("mallName")),
         "search_query": query,
-        "description": f"\ub124\uc774\ubc84 \uc1fc\ud551\uc5d0\uc11c '{query}'\ub85c \uac80\uc0c9\ub41c \uc0c1\ud488\uc785\ub2c8\ub2e4.",
+        "description": f"네이버 쇼핑에서 '{query}'로 검색된 상품입니다.",
     }
 
 
@@ -467,12 +472,16 @@ async def enrich_naver_review_info(
     product: Dict[str, Any],
 ) -> Dict[str, Any]:
     urls: List[str] = []
-    if product.get("source_url"):
-        urls.append(str(product["source_url"]))
-    naver_product_id = product.get("naver_product_id")
-    if naver_product_id:
-        urls.append(f"https://search.shopping.naver.com/catalog/{naver_product_id}")
+    for key in ("source_url", "product_url"):
+        url = product.get(key)
+        if url:
+            urls.append(str(url))
 
+    catalog_id = product.get("naver_catalog_id")
+    if catalog_id:
+        urls.append(f"https://search.shopping.naver.com/catalog/{catalog_id}")
+
+    attempted_urls: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for url in urls:
         if not url or url in seen:
@@ -480,9 +489,17 @@ async def enrich_naver_review_info(
         seen.add(url)
         try:
             response = await client.get(url)
+            attempted_urls.append({
+                "url": url,
+                "status_code": response.status_code,
+                "final_url": str(response.url),
+                "content_length": len(response.text),
+            })
             response.raise_for_status()
             info = extract_review_info_from_html(response.text)
         except Exception as exc:
+            if attempted_urls:
+                attempted_urls[-1]["error"] = str(exc)
             logger.info("naver review enrich failed: url=%s error=%s", url, exc)
             continue
 
@@ -492,8 +509,10 @@ async def enrich_naver_review_info(
             bool(info.get("review_texts")),
         ])
         if not has_review_data:
+            attempted_urls[-1]["review_data_found"] = False
             continue
 
+        attempted_urls[-1]["review_data_found"] = True
         if info.get("rating") is not None:
             product["rating"] = info["rating"]
         if info.get("review_count") is not None:
@@ -503,6 +522,8 @@ async def enrich_naver_review_info(
         product["review_data_available"] = True
         product["review_source"] = url
         break
+
+    product["review_attempted_urls"] = attempted_urls
 
     try:
         logger.info(
@@ -514,6 +535,9 @@ async def enrich_naver_review_info(
                 "review_data_available": product.get("review_data_available"),
                 "review_source": product.get("review_source"),
                 "review_texts": product.get("review_texts"),
+                "review_attempted_urls": attempted_urls,
+                "naver_product_id": product.get("naver_product_id"),
+                "naver_catalog_id": product.get("naver_catalog_id"),
             }, ensure_ascii=False, indent=2, default=str),
         )
     except Exception:
