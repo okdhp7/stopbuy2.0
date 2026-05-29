@@ -81,7 +81,7 @@ def log_agent_payload(direction: str, payload: Any) -> None:
     except Exception:
         text = repr(payload)
 
-    if len(text) > LOG_PAYLOAD_MAX_LENGTH:
+    if LOG_PAYLOAD_MAX_LENGTH > 0 and len(text) > LOG_PAYLOAD_MAX_LENGTH:
         text = f"{text[:LOG_PAYLOAD_MAX_LENGTH]}... <truncated length={len(text)}>"
 
     logger.info("backend agent %s payload: %s", direction, text)

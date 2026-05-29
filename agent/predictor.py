@@ -1,8 +1,9 @@
-﻿import argparse
+import argparse
 import json
 import math
 import os
 import random
+import re
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,17 +18,42 @@ from sklearn.exceptions import InconsistentVersionWarning
 from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
 
+try:
+    from env_loader import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 
 TARGET_COLUMN = "구매후회값"
-NUMERIC_COLUMNS = [
+RAW_NUMERIC_COLUMNS = [
     "나이",
     "월수입",
-    "가격",
+    "예산",
+    "구매단가",
+    "판매단가",
+    "평점",
+    "리뷰수",
     "상품조회수",
     "비교상품수",
     "구매시간대",
     "재방문횟수",
 ]
+ENGINEERED_NUMERIC_COLUMNS = [
+    "예산초과율",
+    "예산사용율",
+    "사용목적적합도",
+    "중요요소일치도",
+    "브랜드선호일치도",
+    "대체상품우위위험",
+    "가격신뢰위험",
+    "리뷰부정위험",
+    "상품신뢰도",
+    "데이터신뢰도",
+    "구매필요성점수",
+]
+MODEL_NUMERIC_COLUMNS = RAW_NUMERIC_COLUMNS + ENGINEERED_NUMERIC_COLUMNS
 CATEGORICAL_COLUMNS = [
     "성별",
     "직업",
@@ -36,13 +62,72 @@ CATEGORICAL_COLUMNS = [
     "가격등급",
     "카테고리",
     "브랜드",
+    "상품정보출처",
     "카드할부여부",
 ]
-TRAINING_COLUMNS = NUMERIC_COLUMNS + CATEGORICAL_COLUMNS
+TRAINING_COLUMNS = MODEL_NUMERIC_COLUMNS + CATEGORICAL_COLUMNS
+SOURCE_DATASET_COLUMNS = [
+    "성별",
+    "나이",
+    "월수입",
+    "직업",
+    "결혼여부",
+    "소비성향",
+    "예산",
+    "구매단가",
+    "사용목적",
+    "중요요소",
+    "선호브랜드",
+    "상품명",
+    "브랜드",
+    "카테고리",
+    "판매단가",
+    "평점",
+    "리뷰수",
+    "상품설명",
+    "상품정보출처",
+    "상품조회수",
+    "비교상품수",
+    "구매시간대",
+    "재방문횟수",
+    "카드할부여부",
+]
+
+DATASET_FILENAME = "purchase_regret_training_dataset_source.xlsx"
+FALLBACK_DATASET_FILENAMES = [
+    "purchase_regret_training_dataset_v2.xlsx",
+    "purchase_regret_training_dataset_1500.xlsx",
+]
+
+
+## 로컬 실행과 Docker 실행 모두에서 학습 데이터 경로를 찾습니다.
+def resolve_default_dataset_path() -> Path:
+    env_path = os.getenv("REGRET_DATASET_PATH")
+    if env_path:
+        return Path(env_path)
+    module_dir = Path(__file__).resolve().parent
+    candidates = [
+        module_dir / "datas" / DATASET_FILENAME,
+        module_dir.parent / "datas" / DATASET_FILENAME,
+    ]
+    for filename in FALLBACK_DATASET_FILENAMES:
+        candidates.extend([
+            module_dir / "datas" / filename,
+            module_dir.parent / "datas" / filename,
+        ])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[-1]
+
 
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "regret_model.pkl"
-DEFAULT_DATASET_PATH = Path(__file__).resolve().parents[1] / "datas" / "purchase_regret_training_dataset_1500.xlsx"
+DEFAULT_DATASET_PATH = resolve_default_dataset_path()
 DEFAULT_OPTIONS_PATH = Path(__file__).resolve().parent / "agent_options.json"
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")
+LLM_PREFERENCE_TIMEOUT_SECONDS = float(os.getenv("LLM_PREFERENCE_TIMEOUT_SECONDS", "12"))
+LLM_PREFERENCE_BLEND_WEIGHT = float(os.getenv("LLM_PREFERENCE_BLEND_WEIGHT", "0.6"))
+LLM_PREFERENCE_ENABLED = os.getenv("LLM_PREFERENCE_ENABLED", "true").lower() not in {"0", "false", "no", "n"}
 DEFAULT_AGENT_OPTIONS = {
     "alternative_regret_score_threshold": 30,
     "max_alternative_products": 5,
@@ -215,7 +300,7 @@ def normalize_category(
     category: Optional[str],
 ) -> str:
     text = str(category or "").lower()
-    if any(keyword in text for keyword in ["server", "proliant", "microserver"]):
+    if any(keyword in text for keyword in ["server", "proliant", "microserver", "workstation", "nas", "서버", "워크스테이션"]):
         return "전자기기"
     if any(keyword in text for keyword in ["phone", "iphone", "galaxy", "pixel", "스마트폰", "휴대폰"]):
         return "전자기기"
@@ -272,6 +357,162 @@ def normalize_brand(
 
 
 ## 온라인 입력의 사용자/상품 정보를 모델 학습 피처 한 행으로 변환합니다.
+
+## 안전하게 0~1 범위 점수로 제한합니다.
+def clamp_unit(
+    value: float,
+) -> float:
+    return max(0.0, min(1.0, safe_float(value)))
+
+
+## 규칙 기반 적합도와 LLM 적합도를 가중 평균으로 결합합니다.
+def blend_llm_fit_score(
+    rule_score: float,
+    llm_score: Any,
+) -> float:
+    if llm_score is None:
+        return clamp_unit(rule_score)
+    llm_value = clamp_unit(safe_float(llm_score, rule_score))
+    weight = clamp_unit(LLM_PREFERENCE_BLEND_WEIGHT)
+    return clamp_unit(rule_score * (1.0 - weight) + llm_value * weight)
+
+
+## 입력 토큰과 상품 토큰의 단순 중첩 유사도를 계산합니다.
+def preference_similarity_score(
+    input_value: Any,
+    product: Dict[str, Any],
+) -> float:
+    input_tokens = tokenize_preference_text(input_value)
+    if not input_tokens:
+        return 0.5
+    product_tokens = tokenize_preference_text(product_preference_text(product))
+    if not product_tokens:
+        return 0.0
+    matched = input_tokens & product_tokens
+    return clamp_unit(len(matched) / max(len(input_tokens), 1))
+
+
+## 상품 카테고리와 사용목적에서 구매 필요성 점수를 추정합니다.
+def purchase_necessity_score(
+    user: Dict[str, Any],
+    product: Dict[str, Any],
+) -> float:
+    purpose_tokens = tokenize_preference_text(user.get("usage_purpose"))
+    category = normalize_category(product.get("category"))
+    text = product_preference_text(product).lower()
+    practical_categories = {"식품", "생활용품", "교육", "건강관리"}
+    discretionary_categories = {"명품", "패션", "화장품", "여행"}
+    work_tokens = {"work", "business", "office", "server", "storage", "업무", "사업", "사무", "서버", "백업", "스토리지"}
+    score = 0.5
+    if category in practical_categories:
+        score += 0.2
+    if category in discretionary_categories:
+        score -= 0.15
+    if purpose_tokens:
+        score += (preference_similarity_score(user.get("usage_purpose"), product) - 0.5) * 0.5
+    if any(word in text for word in ["업무", "공부", "학습", "생활", "필수", "office", "study", "daily"]):
+        score += 0.12
+    if purpose_tokens & work_tokens and any(word in text for word in ["server", "proliant", "microserver", "workstation", "nas", "서버", "워크스테이션", "백업", "스토리지"]):
+        score += 0.18
+    if any(word in text for word in ["한정", "럭셔리", "명품", "선물", "limited", "premium"]):
+        score -= 0.08
+    return clamp_unit(score)
+
+
+## 평점/리뷰수는 보조 신호로만 쓰도록 상품 신뢰도를 계산합니다.
+def product_trust_score(
+    product: Dict[str, Any],
+) -> float:
+    rating_missing = bool(product.get("rating_missing"))
+    review_count_missing = bool(product.get("review_count_missing"))
+    review_data_available = bool(product.get("review_data_available"))
+    rating = safe_float(product.get("rating"), 3.5)
+    review_count = safe_int(product.get("review_count"))
+    rating_score = 0.5 if rating_missing else clamp_unit((rating - 3.0) / 2.0)
+    volume_score = 0.35 if review_count_missing else clamp_unit(math.log1p(max(review_count, 0)) / math.log1p(1000))
+    source_score = 0.65 if review_data_available else 0.25
+    return clamp_unit(rating_score * 0.25 + volume_score * 0.25 + source_score * 0.50)
+
+
+## 가격, 조건 적합도, 대체상품 가능성 등 구매후회 핵심 입력지표를 산출합니다.
+def purchase_decision_features(
+    user: Dict[str, Any],
+    product: Dict[str, Any],
+) -> Dict[str, float]:
+    price = safe_float(product.get("price"))
+    budget = safe_float(user.get("budget"))
+    purchase_unit_price = safe_float(
+        user.get("purchase_unit_price")
+        or product.get("purchase_unit_price")
+        or product.get("target_price")
+        or price
+    )
+    if budget <= 0:
+        monthly_income = safe_float(user.get("monthly_income"))
+        budget = monthly_income * 0.08 if monthly_income > 0 else 0.0
+
+    budget_usage = price / max(budget, 1.0) if budget > 0 else 0.0
+    budget_overrun = max(0.0, budget_usage - 1.0)
+    llm_scores = product.get("llm_preference_scores") or {}
+    purpose_fit = blend_llm_fit_score(
+        preference_similarity_score(user.get("usage_purpose"), product),
+        llm_scores.get("usage_purpose_fit"),
+    )
+    factor_fit = blend_llm_fit_score(
+        preference_similarity_score(user.get("important_factors"), product),
+        llm_scores.get("important_factor_fit"),
+    )
+
+    preferred_tokens = tokenize_preference_text(user.get("preferred_brands"))
+    brand_tokens = tokenize_preference_text(product.get("brand"), product.get("name"))
+    if preferred_tokens:
+        brand_fit = 1.0 if preferred_tokens & brand_tokens else 0.0
+    else:
+        brand_fit = 0.5
+
+    target_price = safe_float(product.get("target_price"))
+    alternative_price = safe_float(product.get("best_alternative_price"))
+    if alternative_price > 0 and price > 0:
+        alternative_risk = clamp_unit((price - alternative_price) / max(price, 1.0))
+    elif budget > 0 and price > budget:
+        alternative_risk = clamp_unit((price - budget) / max(price, 1.0))
+    elif target_price > 0 and price > target_price:
+        alternative_risk = clamp_unit((price - target_price) / max(price, 1.0))
+    else:
+        alternative_risk = 0.0
+
+    market_low_price = safe_float(product.get("market_low_price") or product.get("lowest_price"))
+    if market_low_price > 0 and price > market_low_price:
+        price_reliability_risk = clamp_unit((price - market_low_price) / max(market_low_price, 1.0))
+    else:
+        price_reliability_risk = 0.35 if product.get("price_estimated") else 0.05
+
+    negative_review_risk = clamp_unit(len(detect_negative_review_signals(product)) / 5.0)
+    trust_score = product_trust_score(product)
+    data_reliability = 0.35
+    if not product.get("price_estimated") and price > 0:
+        data_reliability += 0.25
+    if product.get("source_url") or product.get("product_url"):
+        data_reliability += 0.15
+    if product.get("review_data_available"):
+        data_reliability += 0.25
+    necessity = purchase_necessity_score(user, product)
+
+    return {
+        "예산초과율": clamp_unit(budget_overrun),
+        "예산사용율": min(budget_usage, 3.0),
+        "사용목적적합도": purpose_fit,
+        "중요요소일치도": factor_fit,
+        "브랜드선호일치도": brand_fit,
+        "대체상품우위위험": alternative_risk,
+        "가격신뢰위험": price_reliability_risk,
+        "리뷰부정위험": negative_review_risk,
+        "상품신뢰도": trust_score,
+        "데이터신뢰도": clamp_unit(data_reliability),
+        "구매필요성점수": necessity,
+    }
+
+
 def build_training_row(
     user: Dict[str, Any],
     product: Dict[str, Any],
@@ -282,8 +523,18 @@ def build_training_row(
     price_estimated = bool(product.get("price_estimated"))
     rating = safe_float(product.get("rating"), 3.5)
     budget = safe_float(user.get("budget"))
+    purchase_unit_price = safe_float(
+        user.get("purchase_unit_price")
+        or product.get("purchase_unit_price")
+        or product.get("target_price")
+        or price
+    )
     category = normalize_category(product.get("category"))
     brand = normalize_brand(product.get("brand"), product.get("name"))
+    decision_product = dict(product)
+    decision_product["category"] = category
+    decision_product["brand"] = brand
+    decision_features = purchase_decision_features(user, decision_product)
 
     views = max(2, min(60, int(review_count / 20) + 10))
     comparison_count = max(0, min(60, int(return_rate / 2 + max(0.0, 4.0 - rating) * 3)))
@@ -297,15 +548,21 @@ def build_training_row(
         "직업": user.get("job") or "사무직",
         "결혼여부": user.get("marital_status") or "미혼",
         "소비성향": user.get("consumption_type") or "보수적",
-        "가격": price,
+        "예산": budget,
+        "구매단가": purchase_unit_price,
+        "판매단가": price,
+        "평점": rating,
+        "리뷰수": review_count,
         "가격등급": product.get("price_grade") or price_grade(price),
         "카테고리": category,
         "브랜드": brand,
+        "상품정보출처": product.get("product_info_source") or product.get("review_source") or product.get("source") or product.get("source_url") or "user_input",
         "상품조회수": views,
         "비교상품수": comparison_count,
         "구매시간대": safe_int(user.get("purchase_hour"), 15),
         "카드할부여부": product.get("card_installment") or installment,
         "재방문횟수": revisit_count,
+        **decision_features,
     }
 
 
@@ -324,18 +581,63 @@ def normalize_user_input_list(
     return [str(item).strip() for item in values if str(item).strip()]
 
 
+## 사용자 구매조건이 비어 있으면 상품정보를 기준으로 예산과 선호브랜드를 보정합니다.
+def resolve_purchase_inputs(
+    user: Dict[str, Any],
+    product: Dict[str, Any],
+) -> Dict[str, Any]:
+    resolved_user = dict(user or {})
+    price = safe_float(product.get("price"))
+    budget = safe_float(resolved_user.get("budget"))
+    monthly_income = safe_float(resolved_user.get("monthly_income"))
+    preferred_brands = normalize_user_input_list(resolved_user.get("preferred_brands"))
+    product_brand = normalize_brand(product.get("brand"), product.get("name"))
+
+    if budget > 0:
+        budget_source = "user_input"
+    elif price > 0:
+        budget = price
+        budget_source = "product_price"
+    elif monthly_income > 0:
+        budget = monthly_income * 0.08
+        budget_source = "income_estimated"
+    else:
+        budget = 0.0
+        budget_source = "empty"
+    resolved_user["budget"] = budget
+
+    if preferred_brands:
+        preferred_brand_source = "user_input"
+    elif product_brand and product_brand != "기타":
+        preferred_brands = [product_brand]
+        preferred_brand_source = "product_brand"
+    else:
+        preferred_brand_source = "empty"
+    resolved_user["preferred_brands"] = preferred_brands
+
+    return {
+        "user": resolved_user,
+        "metadata": {
+            "budget": budget,
+            "budget_source": budget_source,
+            "preferred_brands": preferred_brands,
+            "preferred_brand_source": preferred_brand_source,
+        },
+    }
+
+
 ## Detect explicit risk words in product name, category, and description.
 def detect_product_risk_keywords(
     product: Dict[str, Any],
 ) -> List[str]:
     text = product_preference_text(product).lower()
     keyword_groups = {
-        "\uc911\uace0": ["\uc911\uace0", "used", "secondhand"],
-        "\ub9ac\ud37c": ["\ub9ac\ud37c", "\ub9ac\ud37c\ube44\uc2dc", "refurb", "refurbished"],
-        "\ud638\ud658\ud488": ["\ud638\ud658", "compatible", "replacement"],
-        "\ubd80\ud488": ["\ubd80\ud488", "parts", "part only"],
-        "\ubc8c\ud06c": ["\ubc8c\ud06c", "bulk"],
-        "\ud574\uc678\uc9c1\uad6c": ["\ud574\uc678\uc9c1\uad6c", "\uc9c1\uad6c", "import", "\uad6c\ub9e4\ub300\ud589"],
+        "중고": ["중고", "used", "secondhand"],
+        "리퍼": ["리퍼", "리퍼비시", "refurb", "refurbished"],
+        "호환품": ["호환", "compatible", "replacement"],
+        "부품": ["부품", "parts", "part only"],
+        "벌크": ["벌크", "bulk"],
+        "해외직구": ["해외직구", "직구", "import", "구매대행"],
     }
     found: List[str] = []
     for label, keywords in keyword_groups.items():
@@ -352,7 +654,7 @@ def detect_negative_review_signals(
     if not isinstance(review_texts, list):
         return []
     negative_keywords = {
-        "\ubd88\ub7c9", "\uace0\uc7a5", "\ud30c\uc190", "\ubc18\ud488", "\ud658\ubd88", "\uc2e4\ub9dd", "\ubcc4\ub85c", "\ucd5c\uc545", "\ub290\ub9bc", "\uc18c\uc74c", "\ub0c4\uc0c8",
+        "불량", "고장", "파손", "반품", "환불", "실망", "별로", "최악", "느림", "소음", "냄새",
         "defect", "broken", "refund", "return", "disappointed", "bad", "worst", "noise",
     }
     joined = " ".join(str(text).lower() for text in review_texts)
@@ -413,25 +715,25 @@ def make_regret_causes(
     if not review_data_available:
         causes.append({
             "code": "REVIEW_DATA_MISSING",
-            "title": "\ud3c9\uac00\uc815\ubcf4 \ubd80\uc871",
-            "message": "\ud3c9\uc810\uacfc \ud6c4\uae30\uac1c\uc218\ub97c \ud655\uc778\ud558\uc9c0 \ubabb\ud574 \uc2e4\uc81c \ub9cc\uc871\ub3c4 \uac80\uc99d\uc774 \ubd80\uc871\ud569\ub2c8\ub2e4.",
-            "severity": "medium",
-            "impact_score": 0.38,
+            "title": "평가정보 부족",
+            "message": "평점과 후기개수를 확인하지 못해 실제 만족도 검증이 부족합니다.",
+            "severity": "low",
+            "impact_score": 0.16,
         })
     elif review_count < 20:
         causes.append({
             "code": "LOW_REVIEW_COUNT",
-            "title": "?? ??",
-            "message": "?? ?? ?? ???? ???? ?? ??? ???? ????.",
-            "severity": "medium",
-            "impact_score": 0.35,
+            "title": "리뷰 수 부족",
+            "message": "후기 수가 적어 실제 사용자 만족도를 판단하기에 근거가 부족합니다.",
+            "severity": "low",
+            "impact_score": 0.18,
         })
     preferred_brands = normalize_user_input_list(user.get("preferred_brands"))
     if preferred_brands and not alignment.get("matched_preferred_brand"):
         causes.append({
             "code": "PREFERRED_BRAND_MISMATCH",
-            "title": "\uc120\ud638\ube0c\ub79c\ub4dc \ubd88\uc77c\uce58",
-            "message": f"\uc785\ub825\ud55c \uc120\ud638\ube0c\ub79c\ub4dc({', '.join(preferred_brands[:3])})\uc640 \ub300\uc0c1 \uc0c1\ud488 \ube0c\ub79c\ub4dc\uac00 \ucda9\ubd84\ud788 \uc77c\uce58\ud558\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4.",
+            "title": "선호브랜드 불일치",
+            "message": f"입력한 선호브랜드({', '.join(preferred_brands[:3])})와 대상 상품 브랜드가 충분히 일치하지 않습니다.",
             "severity": "medium",
             "impact_score": 0.24,
         })
@@ -442,16 +744,16 @@ def make_regret_causes(
     if important_factors and condition_similarity < 0.18:
         causes.append({
             "code": "IMPORTANT_FACTOR_MISMATCH",
-            "title": "\uc911\uc694\uc694\uc18c \ubd88\uc77c\uce58",
-            "message": f"\uc911\uc694\ud558\uac8c \uc785\ub825\ud55c \uc694\uc18c({', '.join(important_factors[:3])})\uac00 \uc0c1\ud488\uba85/\ube0c\ub79c\ub4dc/\uce74\ud14c\uace0\ub9ac/\uc124\uba85\uc5d0\uc11c \ucda9\ubd84\ud788 \ud655\uc778\ub418\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4.",
+            "title": "중요요소 불일치",
+            "message": f"중요하게 입력한 요소({', '.join(important_factors[:3])})가 상품명/브랜드/카테고리/설명에서 충분히 확인되지 않습니다.",
             "severity": "medium",
             "impact_score": 0.26,
         })
     if purpose and condition_similarity < 0.18:
         causes.append({
             "code": "PURPOSE_MISMATCH",
-            "title": "\uc0ac\uc6a9\ubaa9\uc801 \uc801\ud569\ub3c4 \ub0ae\uc74c",
-            "message": f"\uc0ac\uc6a9\ubaa9\uc801({purpose[:40]})\uacfc \uc0c1\ud488 \uc815\ubcf4\uc758 \uc5f0\uad00\uc131\uc774 \ub0ae\uc544 \uc2e4\uc81c \uc0ac\uc6a9 \ud6c4 \ubd88\ub9cc\uc774 \uc0dd\uae38 \uc218 \uc788\uc2b5\ub2c8\ub2e4.",
+            "title": "사용목적 적합도 낮음",
+            "message": f"사용목적({purpose[:40]})과 상품 정보의 연관성이 낮아 실제 사용 후 불만이 생길 수 있습니다.",
             "severity": "medium",
             "impact_score": 0.25,
         })
@@ -460,9 +762,9 @@ def make_regret_causes(
     if risk_keywords:
         causes.append({
             "code": "RISK_KEYWORD_USED",
-            "title": "\uc0c1\ud488\uba85 \uc704\ud5d8 \ud0a4\uc6cc\ub4dc",
-            "message": f"\uc0c1\ud488 \uc815\ubcf4\uc5d0 {', '.join(risk_keywords)} \ud45c\ud604\uc774 \ud3ec\ud568\ub418\uc5b4 \uad6c\ub9e4 \uc804 \uc0c1\ud0dc\uc640 \uc870\uac74\uc744 \ub354 \ud655\uc778\ud574\uc57c \ud569\ub2c8\ub2e4.",
-            "severity": "high" if any(keyword in risk_keywords for keyword in ["\uc911\uace0", "\ub9ac\ud37c", "\ubd80\ud488"]) else "medium",
+            "title": "상품명 위험 키워드",
+            "message": f"상품 정보에 {', '.join(risk_keywords)} 표현이 포함되어 구매 전 상태와 조건을 더 확인해야 합니다.",
+            "severity": "high" if any(keyword in risk_keywords for keyword in ["중고", "리퍼", "부품"]) else "medium",
             "impact_score": 0.42,
         })
 
@@ -470,8 +772,8 @@ def make_regret_causes(
     if negative_reviews:
         causes.append({
             "code": "REVIEW_NEGATIVE_SIGNAL",
-            "title": "\ub9ac\ubdf0 \ubd80\uc815 \uc2e0\ud638",
-            "message": f"\uc218\uc9d1\ub41c \ub9ac\ubdf0 \uc0d8\ud50c\uc5d0\uc11c {', '.join(negative_reviews)} \uad00\ub828 \ud45c\ud604\uc774 \uac10\uc9c0\ub418\uc5c8\uc2b5\ub2c8\ub2e4.",
+            "title": "리뷰 부정 신호",
+            "message": f"수집된 리뷰 샘플에서 {', '.join(negative_reviews)} 관련 표현이 감지되었습니다.",
             "severity": "medium",
             "impact_score": 0.32,
         })
@@ -509,7 +811,7 @@ def tokenize_preference_text(
             tokens.update(tokenize_preference_text(*value))
             continue
         text = str(value).lower()
-        for separator in [",", "/", "|", "&", "?", "?", "\\", "\n", "\t"]:
+        for separator in [",", "/", "|", "&", "?", "-", "\\", "\n", "\t"]:
             text = text.replace(separator, " ")
         raw_tokens = [token.strip() for token in text.split() if token.strip()]
         tokens.update(raw_tokens)
@@ -517,17 +819,19 @@ def tokenize_preference_text(
         if compact:
             tokens.add(compact)
     aliases = {
-        "apple": ["iphone", "airpods", "macbook", "\uc560\ud50c"],
-        "samsung": ["galaxy", "buds", "\uc0bc\uc131"],
-        "sony": ["wh-1000xm", "headphone", "\uc18c\ub2c8"],
-        "price": ["budget", "cheap", "value", "\uac00\uaca9", "\uc608\uc0b0", "\uac00\uc131\ube44", "\uc800\ub834"],
-        "quality": ["rating", "performance", "premium", "\ud488\uc9c8", "\ud3c9\uc810", "\uc131\ub2a5", "\uc644\uc131\ub3c4"],
-        "portable": ["light", "battery", "mobile", "\ud734\ub300", "\uac00\ubcbc\uc6c0", "\ubc30\ud130\ub9ac"],
-        "work": ["office", "business", "productivity", "\uc5c5\ubb34", "\uc0ac\ubb34", "\ubb38\uc11c"],
-        "game": ["gaming", "performance", "display", "\uac8c\uc784", "\uace0\uc131\ub2a5"],
-        "study": ["education", "lecture", "reading", "\uacf5\ubd80", "\uac15\uc758", "\ud559\uc2b5"],
-        "travel": ["trip", "portable", "battery", "\uc5ec\ud589", "\ud734\ub300"],
-        "stable": ["return", "durable", "reliable", "\uc548\uc815", "\ub0b4\uad6c", "\ubc18\ud488"],
+        "apple": ["iphone", "airpods", "macbook", "애플"],
+        "samsung": ["galaxy", "buds", "삼성"],
+        "sony": ["wh-1000xm", "headphone", "소니"],
+        "price": ["budget", "cheap", "value", "가격", "예산", "가성비", "저렴"],
+        "quality": ["rating", "performance", "premium", "품질", "평점", "성능", "완성도"],
+        "portable": ["light", "battery", "mobile", "휴대", "가벼움", "배터리"],
+        "work": ["office", "business", "productivity", "job", "업무", "사무", "문서", "사업", "회사"],
+        "server": ["server", "workstation", "microserver", "proliant", "nas", "서버", "워크스테이션", "백업", "스토리지", "홈서버"],
+        "storage": ["storage", "backup", "raid", "disk", "스토리지", "백업", "저장", "디스크"],
+        "game": ["gaming", "performance", "display", "게임", "고성능"],
+        "study": ["education", "lecture", "reading", "공부", "강의", "학습"],
+        "travel": ["trip", "portable", "battery", "여행", "휴대"],
+        "stable": ["return", "durable", "reliable", "안정", "내구", "반품"],
     }
     expanded = set(tokens)
     for canonical, words in aliases.items():
@@ -541,10 +845,109 @@ def tokenize_preference_text(
 def product_preference_text(
     product: Dict[str, Any],
 ) -> str:
-    return " ".join(
+    base_text = " ".join(
         str(product.get(key) or "")
         for key in ["name", "brand", "category", "description"]
     )
+    return f"{base_text} {normalize_category(product.get('category'))}"
+
+
+## LLM 응답 문자열에서 JSON 객체를 추출합니다.
+def extract_json_object(
+    text: str,
+) -> Dict[str, Any]:
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+## LLM을 이용해 사용목적과 중요요소가 상품 정보와 의미적으로 맞는지 평가합니다.
+def evaluate_preference_fit_with_llm(
+    user: Dict[str, Any],
+    product: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not LLM_PREFERENCE_ENABLED:
+        return {"used_llm": False, "reason": "disabled"}
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return {"used_llm": False, "reason": "missing_api_key"}
+
+    usage_purpose = str(user.get("usage_purpose") or "").strip()
+    important_factors = normalize_user_input_list(user.get("important_factors"))
+    if not usage_purpose and not important_factors:
+        return {"used_llm": False, "reason": "empty_preference_input"}
+
+    product_payload = {
+        "상품명": product.get("name"),
+        "브랜드": product.get("brand"),
+        "카테고리": product.get("category"),
+        "정규화카테고리": normalize_category(product.get("category")),
+        "상품설명": product.get("description"),
+        "가격": product.get("price"),
+        "평점": product.get("rating"),
+        "리뷰수": product.get("review_count"),
+    }
+    user_payload = {
+        "사용목적": usage_purpose,
+        "중요요소": important_factors,
+        "선호브랜드": normalize_user_input_list(user.get("preferred_brands")),
+        "예산": user.get("budget"),
+    }
+    prompt = (
+        "사용자의 구매조건과 상품정보를 비교해 의미적 적합도를 평가하세요. "
+        "가격이나 예산 초과 여부는 판단하지 말고, 사용목적과 중요요소가 상품명, 브랜드, 카테고리, 상품설명과 얼마나 맞는지만 평가하세요. "
+        "점수는 0.0부터 1.0 사이 숫자로 작성하고, 반드시 JSON 객체만 반환하세요.\n\n"
+        f"사용자 입력:\n{json.dumps(user_payload, ensure_ascii=False, indent=2)}\n\n"
+        f"상품 정보:\n{json.dumps(product_payload, ensure_ascii=False, indent=2)}\n\n"
+        "반환 형식:\n"
+        "{\n"
+        '  "usage_purpose_fit": 0.0,\n'
+        '  "important_factor_fit": 0.0,\n'
+        '  "evidence": ["근거 1", "근거 2"]\n'
+        "}"
+    )
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key, timeout=LLM_PREFERENCE_TIMEOUT_SECONDS)
+        response = client.chat.completions.create(
+            model=LLM_MODEL_NAME,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": "당신은 상품 구매조건과 상품정보의 의미적 적합도를 보수적으로 평가하는 분석가입니다.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = response.choices[0].message.content or ""
+        parsed = extract_json_object(content)
+        if "usage_purpose_fit" not in parsed and "important_factor_fit" not in parsed:
+            return {"used_llm": False, "reason": "empty_llm_scores"}
+        return {
+            "used_llm": True,
+            "usage_purpose_fit": clamp_unit(parsed.get("usage_purpose_fit", 0.5)),
+            "important_factor_fit": clamp_unit(parsed.get("important_factor_fit", 0.5)),
+            "evidence": parsed.get("evidence") if isinstance(parsed.get("evidence"), list) else [],
+            "model": LLM_MODEL_NAME,
+        }
+    except Exception as exc:
+        return {"used_llm": False, "reason": f"llm_error: {exc}"}
 
 
 ## Calculate how well a product matches user brand, factor, and purpose preferences.
@@ -558,7 +961,7 @@ def preference_alignment(
     preferred_tokens = tokenize_preference_text(user.get("preferred_brands"))
     factor_tokens = tokenize_preference_text(user.get("important_factors"))
     purpose_tokens = tokenize_preference_text(user.get("usage_purpose"))
-    budget_factor_tokens = {"price", "budget", "cheap", "value", "\uac00\uaca9", "\uc608\uc0b0", "\uac00\uc131\ube44", "\uc800\ub834"}
+    budget_factor_tokens = {"price", "budget", "cheap", "value", "가격", "예산", "가성비", "저렴"}
     condition_tokens = (factor_tokens - budget_factor_tokens) | purpose_tokens
 
     matched_preferred = bool(preferred_tokens & brand_tokens)
@@ -601,7 +1004,7 @@ def preference_alignment(
             adjustment -= min(0.04 + under_ratio * 0.04, 0.08)
             reasons.append("price_factor_in_budget")
 
-    if factor_tokens & {"quality", "rating", "performance", "\ud488\uc9c8", "\ud3c9\uc810", "\uc131\ub2a5", "\uc644\uc131\ub3c4"}:
+    if factor_tokens & {"quality", "rating", "performance", "품질", "평점", "성능", "완성도"}:
         if rating >= 4.3:
             adjustment -= 0.035
             reasons.append("quality_factor_good_rating")
@@ -609,7 +1012,7 @@ def preference_alignment(
             adjustment += 0.05
             reasons.append("quality_factor_low_rating")
 
-    if factor_tokens & {"stable", "return", "durable", "\uc548\uc815", "\ub0b4\uad6c", "\ubc18\ud488"}:
+    if factor_tokens & {"stable", "return", "durable", "안정", "내구", "반품"}:
         if return_rate <= 5:
             adjustment -= 0.03
             reasons.append("stability_factor_low_return")
@@ -641,6 +1044,7 @@ def explicit_risk_score(
     return_rate = safe_float(product.get("return_rate"), 5.0)
     review_count = safe_int(product.get("review_count"))
     review_data_available = bool(product.get("review_data_available"))
+    decision_features = purchase_decision_features(user, product)
 
     score = 0.0
     if budget > 0 and price > budget:
@@ -653,14 +1057,24 @@ def explicit_risk_score(
         under_ratio = (budget - price) / max(budget, 1.0)
         score -= min(under_ratio * 0.08, 0.08)
 
+    score += max(0.0, 0.5 - decision_features["사용목적적합도"]) * 0.28
+    score += max(0.0, 0.5 - decision_features["중요요소일치도"]) * 0.20
+    score += max(0.0, 0.5 - decision_features["브랜드선호일치도"]) * 0.08
+    score += decision_features["대체상품우위위험"] * 0.12
+    score += decision_features["가격신뢰위험"] * 0.07
+    score += decision_features["리뷰부정위험"] * 0.07
+    score += max(0.0, 0.5 - decision_features["구매필요성점수"]) * 0.06
+    score += max(0.0, 0.55 - decision_features["상품신뢰도"]) * 0.05
+    score += max(0.0, 0.5 - decision_features["데이터신뢰도"]) * 0.04
+
     if not rating_missing and rating < 4.2:
-        score += min((4.2 - rating) / 2.2, 1.0) * 0.2
+        score += min((4.2 - rating) / 2.2, 1.0) * 0.08
     if return_rate > 5:
         score += min((return_rate - 5) / 25.0, 1.0) * 0.22
     if not review_data_available:
-        score += 0.12
+        score += 0.025
     elif review_count < 30:
-        score += ((30 - max(review_count, 0)) / 30.0) * 0.16
+        score += ((30 - max(review_count, 0)) / 30.0) * 0.08
 
     if price >= 1_000_000 and (return_rate >= 10 or (not rating_missing and rating < 3.8)):
         score += 0.1
@@ -677,10 +1091,12 @@ def calibrate_regret_score(
     if rule_score >= 0.65:
         blended = model_score * 0.35 + rule_score * 0.65
     elif rule_score >= 0.4:
-        blended = model_score * 0.5 + rule_score * 0.5
+        blended = model_score * 0.45 + rule_score * 0.55
+    elif model_score >= 0.75:
+        blended = model_score * 0.55 + rule_score * 0.45
     else:
-        blended = model_score * 0.75 + rule_score * 0.25
-    return clamp_score(max(model_score, blended))
+        blended = model_score * 0.65 + rule_score * 0.35
+    return clamp_score(blended)
 
 
 ## 대체상품 추천에 사용하는 간단한 내장 상품 카탈로그입니다.
@@ -716,6 +1132,98 @@ class ProductCatalog:
 
 
 ## xlsx/csv 학습 데이터를 읽고 필수 컬럼이 있는지 검증합니다.
+
+## 원천 학습 데이터 행을 온라인 예측과 같은 방식의 모델 입력 피처로 변환합니다.
+def source_row_to_training_row(
+    row: Dict[str, Any],
+) -> Dict[str, Any]:
+    user = {
+        "gender": row.get("성별"),
+        "age": row.get("나이"),
+        "monthly_income": row.get("월수입"),
+        "job": row.get("직업"),
+        "marital_status": row.get("결혼여부"),
+        "consumption_type": row.get("소비성향"),
+        "budget": row.get("예산"),
+        "purchase_unit_price": row.get("구매단가"),
+        "usage_purpose": row.get("사용목적"),
+        "important_factors": row.get("중요요소"),
+        "preferred_brands": row.get("선호브랜드"),
+        "purchase_hour": row.get("구매시간대"),
+    }
+    product = {
+        "name": row.get("상품명") or row.get("name"),
+        "brand": row.get("브랜드"),
+        "category": row.get("카테고리"),
+        "price": row.get("판매단가") if row.get("판매단가") not in (None, "") else row.get("가격"),
+        "purchase_unit_price": row.get("구매단가"),
+        "target_price": row.get("구매단가"),
+        "rating": row.get("평점") if row.get("평점") not in (None, "") else row.get("rating"),
+        "review_count": row.get("리뷰수") if row.get("리뷰수") not in (None, "") else row.get("review_count"),
+        "description": row.get("상품설명") or row.get("description"),
+        "product_info_source": row.get("상품정보출처"),
+        "card_installment": row.get("카드할부여부"),
+        "price_grade": row.get("가격등급"),
+        "market_low_price": row.get("최저가") or row.get("market_low_price") or row.get("lowest_price"),
+        "best_alternative_price": row.get("대체상품최저가") or row.get("best_alternative_price"),
+        "review_data_available": row.get("평점") not in (None, "") or row.get("리뷰수") not in (None, ""),
+    }
+    training_row = build_training_row(user, product)
+    if row.get("상품조회수") not in (None, ""):
+        training_row["상품조회수"] = safe_int(row.get("상품조회수"))
+    if row.get("비교상품수") not in (None, ""):
+        training_row["비교상품수"] = safe_int(row.get("비교상품수"))
+    if row.get("재방문횟수") not in (None, ""):
+        training_row["재방문횟수"] = safe_int(row.get("재방문횟수"))
+    if row.get("구매시간대") not in (None, ""):
+        training_row["구매시간대"] = safe_int(row.get("구매시간대"), 15)
+    if row.get("카드할부여부") not in (None, ""):
+        training_row["카드할부여부"] = str(row.get("카드할부여부"))
+    return training_row
+
+
+## 원천 컬럼 중심 학습 데이터를 모델 입력 피처로 준비합니다.
+def prepare_training_frame(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    df = frame.copy()
+    if "판매단가" not in df.columns and "가격" in df.columns:
+        df["판매단가"] = df["가격"]
+    if "구매단가" not in df.columns:
+        df["구매단가"] = df.get("판매단가", df.get("가격", 0))
+    if "예산" not in df.columns:
+        income = pd.to_numeric(df.get("월수입"), errors="coerce").fillna(3_790_000.0)
+        df["예산"] = income * 0.08
+    if "평점" not in df.columns and "rating" in df.columns:
+        df["평점"] = df["rating"]
+    if "리뷰수" not in df.columns and "review_count" in df.columns:
+        df["리뷰수"] = df["review_count"]
+    if "상품명" not in df.columns:
+        df["상품명"] = df.get("name", "분석 대상 상품")
+    if "상품설명" not in df.columns:
+        df["상품설명"] = df.get("description", "")
+    if "상품정보출처" not in df.columns:
+        df["상품정보출처"] = "unknown"
+    if "사용목적" not in df.columns:
+        df["사용목적"] = ""
+    if "중요요소" not in df.columns:
+        df["중요요소"] = ""
+    if "선호브랜드" not in df.columns:
+        df["선호브랜드"] = ""
+
+    rows = []
+    for _, row in df.iterrows():
+        rows.append(source_row_to_training_row(row.to_dict()))
+    prepared = pd.DataFrame(rows)
+    if TARGET_COLUMN in df.columns:
+        prepared[TARGET_COLUMN] = pd.to_numeric(df[TARGET_COLUMN], errors="coerce").fillna(0.0).astype(float)
+    missing = [column for column in TRAINING_COLUMNS if column not in prepared.columns]
+    if missing:
+        raise ValueError(f"Prepared training frame is missing columns: {missing}")
+    columns = TRAINING_COLUMNS + ([TARGET_COLUMN] if TARGET_COLUMN in prepared.columns else [])
+    return prepared[columns].copy()
+
+
 def load_dataset(
     path: Path,
 ) -> pd.DataFrame:
@@ -725,9 +1233,9 @@ def load_dataset(
         df = pd.read_excel(path)
     else:
         df = pd.read_csv(path)
-    missing = [column for column in TRAINING_COLUMNS + [TARGET_COLUMN] if column not in df.columns]
-    if missing:
-        raise ValueError(f"Dataset is missing required columns: {missing}")
+    df = prepare_training_frame(df)
+    if TARGET_COLUMN not in df.columns:
+        raise ValueError(f"Dataset is missing required target column: {TARGET_COLUMN}")
     return df[TRAINING_COLUMNS + [TARGET_COLUMN]].copy()
 
 
@@ -736,7 +1244,7 @@ def fit_preprocessor(
     frame: pd.DataFrame,
 ) -> Dict[str, Any]:
     numeric_stats = {}
-    for column in NUMERIC_COLUMNS:
+    for column in MODEL_NUMERIC_COLUMNS:
         values = pd.to_numeric(frame[column], errors="coerce").fillna(0.0).astype(float)
         mean = float(values.mean())
         scale = float(values.std(ddof=0))
@@ -754,7 +1262,7 @@ def fit_preprocessor(
         "type": "manual_v1",
         "numeric_stats": numeric_stats,
         "categorical_values": categorical_values,
-        "input_dim": len(NUMERIC_COLUMNS) + sum(len(values) for values in categorical_values.values()),
+        "input_dim": len(MODEL_NUMERIC_COLUMNS) + sum(len(values) for values in categorical_values.values()),
     }
 
 
@@ -767,7 +1275,7 @@ def transform_features(
         raise ValueError("Unsupported preprocessor format. Retrain the model.")
 
     parts = []
-    for column in NUMERIC_COLUMNS:
+    for column in MODEL_NUMERIC_COLUMNS:
         stats = preprocessor["numeric_stats"][column]
         values = pd.to_numeric(frame[column], errors="coerce").fillna(0.0).astype(float)
         parts.append(((values - stats["mean"]) / stats["scale"]).to_numpy(dtype=np.float32).reshape(-1, 1))
@@ -966,7 +1474,7 @@ class PurchaseRegretModel:
             preprocessor = loaded.get("preprocessor") if isinstance(loaded, dict) else {}
             has_required_features = (
                 has_manual_preprocessor
-                and all(column in preprocessor.get("numeric_stats", {}) for column in NUMERIC_COLUMNS)
+                and all(column in preprocessor.get("numeric_stats", {}) for column in MODEL_NUMERIC_COLUMNS)
                 and all(column in preprocessor.get("categorical_values", {}) for column in CATEGORICAL_COLUMNS)
                 and int(loaded.get("input_dim", 0)) == int(preprocessor.get("input_dim", -1))
             )
@@ -1037,14 +1545,24 @@ class RegretPredictor:
         self,
         user: Dict[str, Any],
         product: Dict[str, Any],
+        use_llm_preference: bool = True,
     ) -> Dict[str, Any]:
-        row = build_training_row(user, product)
+        scoring_product = dict(product)
+        llm_preference = (
+            evaluate_preference_fit_with_llm(user, scoring_product)
+            if use_llm_preference
+            else {"used_llm": False, "reason": "skipped"}
+        )
+        if llm_preference.get("used_llm"):
+            scoring_product["llm_preference_scores"] = llm_preference
+
+        row = build_training_row(user, scoring_product)
         model_score = self.model.predict_row(row)
-        rule_score = explicit_risk_score(user, product)
+        rule_score = explicit_risk_score(user, scoring_product)
         base_regret_score = calibrate_regret_score(model_score, rule_score)
-        alignment = preference_alignment(user, product)
+        alignment = preference_alignment(user, scoring_product)
         regret_score = clamp_score(base_regret_score + alignment["adjustment"])
-        causes = make_regret_causes(regret_score, user, product, alignment)
+        causes = make_regret_causes(regret_score, user, scoring_product, alignment)
         return {
             "feature": row,
             "model_regret_score": model_score,
@@ -1052,6 +1570,8 @@ class RegretPredictor:
             "base_regret_score": base_regret_score,
             "preference_adjustment": alignment["adjustment"],
             "preference_alignment": alignment,
+            "llm_preference_evaluation": llm_preference,
+            "decision_features": purchase_decision_features(user, scoring_product),
             "regret_score": regret_score,
             "regret_causes": causes,
         }
@@ -1069,7 +1589,7 @@ class RegretPredictor:
         review_count_missing = product.get("review_count") in (None, "")
         review_data_available = bool(product.get("review_data_available"))
         normalized_product = {
-            "name": product.get("name") or "?? ?? ??",
+            "name": product.get("name") or "분석 대상 상품",
             "brand": product.get("brand"),
             "category": product.get("category"),
             "price": normalized_price,
@@ -1087,15 +1607,18 @@ class RegretPredictor:
             "image_url": product.get("image_url"),
             "source_url": product.get("source_url"),
         }
-        score_result = self._predict_score(user, normalized_product)
+        resolved_inputs = resolve_purchase_inputs(user, normalized_product)
+        resolved_user = resolved_inputs["user"]
+        score_result = self._predict_score(resolved_user, normalized_product)
         regret_score = score_result["regret_score"]
         alternatives = []
         if regret_score >= self.threshold:
-            alternatives = self.recommend_alternatives(user, normalized_product, regret_score)
+            alternatives = self.recommend_alternatives(resolved_user, normalized_product, regret_score)
 
         return {
             "product": normalized_product,
             "product_name": normalized_product["name"],
+            "resolved_inputs": resolved_inputs["metadata"],
             "regret_score": round(regret_score, 4),
             "regret_level": regret_level(regret_score),
             "model_regret_score": round(score_result["model_regret_score"], 4),
@@ -1103,6 +1626,8 @@ class RegretPredictor:
             "base_regret_score": round(score_result["base_regret_score"], 4),
             "preference_adjustment": round(score_result["preference_adjustment"], 4),
             "preference_alignment": score_result["preference_alignment"],
+            "llm_preference_evaluation": score_result["llm_preference_evaluation"],
+            "decision_features": score_result["decision_features"],
             "threshold": self.threshold,
             "max_alternative_products": self.max_alternative_products,
             "agent_options": self.options,
@@ -1141,7 +1666,7 @@ class RegretPredictor:
         for candidate in candidates:
             if candidate.get("name") == product.get("name"):
                 continue
-            score = self._predict_score(user, candidate)["regret_score"]
+            score = self._predict_score(user, candidate, use_llm_preference=False)["regret_score"]
             if score > target_score:
                 continue
             match_score = self._match_score(user, candidate, target_price)
@@ -1248,34 +1773,34 @@ class RegretPredictor:
         major_causes = [cause for cause in causes if cause.get("code") != "NO_MAJOR_RISK"]
         top_cause = major_causes[0] if major_causes else None
         top_alternative = alternatives[0] if alternatives else None
-        product_name = product.get("name") or "\ubd84\uc11d \ub300\uc0c1 \uc0c1\ud488"
+        product_name = product.get("name") or "분석 대상 상품"
 
         if regret_score >= 0.7:
-            tone = "\uad6c\ub9e4 \uc804 \uc7ac\uac80\ud1a0\uac00 \uac15\ud558\uac8c \ud544\uc694\ud55c \uc0c1\ud0dc\uc785\ub2c8\ub2e4"
+            tone = "구매 전 재검토가 강하게 필요한 상태입니다"
         elif regret_score >= 0.4:
-            tone = "\uba87 \uac00\uc9c0 \ud6c4\ud68c \uc694\uc778\uc774 \uc788\uc5b4 \uc2e0\uc911\ud55c \ube44\uad50\uac00 \ud544\uc694\ud55c \uc0c1\ud0dc\uc785\ub2c8\ub2e4"
+            tone = "몇 가지 후회 요인이 있어 신중한 비교가 필요한 상태입니다"
         else:
-            tone = "\ud604\uc7ac \uc785\ub825 \uc870\uac74\uc5d0\uc11c\ub294 \ube44\uad50\uc801 \ubd80\ub2f4\uc774 \ub0ae\uc740 \uc0c1\ud0dc\uc785\ub2c8\ub2e4"
+            tone = "현재 입력 조건에서는 비교적 부담이 낮은 상태입니다"
 
         risk_explanation = (
-            f"\uac00\uc7a5 \ud070 \uc704\ud5d8 \uc694\uc778\uc740 '{top_cause.get('title')}'\uc785\ub2c8\ub2e4. {top_cause.get('message')}"
+            f"가장 큰 위험 요인은 '{top_cause.get('title')}'입니다. {top_cause.get('message')}"
             if top_cause
-            else "\ud604\uc7ac \uc785\ub825 \uc870\uac74\uc5d0\uc11c\ub294 \ub69c\ub837\ud55c \uace0\uc704\ud5d8 \uc694\uc778\uc774 \ubc1c\uacac\ub418\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4."
+            else "현재 입력 조건에서는 뚜렷한 고위험 요인이 발견되지 않았습니다."
         )
         purchase_advice = (
-            "\uc608\uc0b0, \ub9ac\ubdf0 \uc218, \ud3c9\uc810, \ubc18\ud488\ub960\uc744 \ub2e4\uc2dc \ud655\uc778\ud55c \ub4a4 \uad6c\ub9e4\ub97c \uacb0\uc815\ud558\ub294 \uac83\uc774 \uc88b\uc2b5\ub2c8\ub2e4. "
-            "\ud2b9\ud788 \uac00\uaca9\uc774 \ucd94\uc815\ub41c \uacbd\uc6b0 \uc2e4\uc81c \ud310\ub9e4\uac00\ub97c \ud655\uc778\ud574 \uc810\uc218\ub97c \ub2e4\uc2dc \uacc4\uc0b0\ud574\ubcf4\uc138\uc694."
+            "예산, 리뷰 수, 평점, 반품률을 다시 확인한 뒤 구매를 결정하는 것이 좋습니다. "
+            "특히 가격이 추정된 경우 실제 판매가를 확인해 점수를 다시 계산해보세요."
         )
         alternative_strategy = (
-            f"\ub300\uccb4\uc0c1\ud488 \uc911 '{top_alternative.get('name')}'\uc744 \uba3c\uc800 \ube44\uad50\ud574\ubcf4\uc138\uc694. "
-            f"\uc608\uce21 \ud6c4\ud68c \uc810\uc218\ub294 {round(safe_float(top_alternative.get('regret_score')) * 100)}\uc810\uc785\ub2c8\ub2e4."
+            f"대체상품 중 '{top_alternative.get('name')}'을 먼저 비교해보세요. "
+            f"예측 후회 점수는 {round(safe_float(top_alternative.get('regret_score')) * 100)}점입니다."
             if top_alternative
-            else "\ud604\uc7ac \uc870\uac74\uc5d0\uc11c\ub294 \ucd94\ucc9c\ud560 \ub300\uccb4\uc0c1\ud488\uc774 \ucda9\ubd84\ud558\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4. \uc608\uc0b0\uc774\ub098 \uc120\ud638 \ube0c\ub79c\ub4dc\ub97c \uc785\ub825\ud558\uba74 \ucd94\ucc9c \ud488\uc9c8\uc774 \uc88b\uc544\uc9d1\ub2c8\ub2e4."
+            else "현재 조건에서는 추천할 대체상품이 충분하지 않습니다. 예산이나 선호 브랜드를 입력하면 추천 품질이 좋아집니다."
         )
 
         return {
             "used_llm": False,
-            "summary": f"{product_name}\uc758 \uad6c\ub9e4 \ud6c4\ud68c \uac00\ub2a5\uc131\uc740 {percent}\uc810\uc73c\ub85c \ud3c9\uac00\ub429\ub2c8\ub2e4. {tone}.",
+            "summary": f"{product_name}의 구매 후회 가능성은 {percent}점으로 평가됩니다. {tone}.",
             "risk_explanation": risk_explanation,
             "purchase_advice": purchase_advice,
             "alternative_strategy": alternative_strategy,
@@ -1362,7 +1887,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train or run the purchase regret prediction model.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    train_parser = subparsers.add_parser("train", help="Train model from purchase_regret_training_dataset_1500.xlsx")
+    train_parser = subparsers.add_parser("train", help="Train model from purchase_regret_training_dataset_source.xlsx")
     train_parser.add_argument("--data", default=str(DEFAULT_DATASET_PATH), help="Path to xlsx/csv training dataset.")
     train_parser.add_argument("--model", default=str(DEFAULT_MODEL_PATH), help="Output model path.")
     train_parser.add_argument("--model-type", choices=["torch"], default="torch", help="Estimator type.")

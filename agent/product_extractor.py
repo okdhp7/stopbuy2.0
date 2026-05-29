@@ -580,7 +580,7 @@ async def search_naver_shopping(
     except Exception:
         log_payload = repr(payload)
 
-    if len(log_payload) > NAVER_LOG_PAYLOAD_MAX_LENGTH:
+    if NAVER_LOG_PAYLOAD_MAX_LENGTH > 0 and len(log_payload) > NAVER_LOG_PAYLOAD_MAX_LENGTH:
         log_payload = f"{log_payload[:NAVER_LOG_PAYLOAD_MAX_LENGTH]}... <truncated length={len(log_payload)}>"
     logger.info("naver shopping payload: %s", log_payload)
 

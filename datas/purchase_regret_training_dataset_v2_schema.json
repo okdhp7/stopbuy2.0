@@ -1,0 +1,21 @@
+{
+  "target": "구매후회값",
+  "model_input_weights": {
+    "예산초과율": 0.22,
+    "사용목적부적합": 0.18,
+    "중요요소불일치": 0.16,
+    "대체상품우위위험": 0.12,
+    "브랜드선호불일치": 0.08,
+    "가격신뢰위험": 0.07,
+    "리뷰부정위험": 0.07,
+    "상품신뢰부족": 0.05,
+    "구매필요성부족": 0.03,
+    "행동위험": 0.02
+  },
+  "data_collection_sources": {
+    "상품명/현재가/최저가/브랜드/카테고리": "Naver Shopping Search API",
+    "사용목적/중요요소/선호브랜드/예산": "frontend user input",
+    "평점/리뷰수/리뷰부정키워드": "trusted review source, crawler, or partner API when available",
+    "실제구매후회값": "post-purchase feedback; synthetic label only for initial training"
+  }
+}
