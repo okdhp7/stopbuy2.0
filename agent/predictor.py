@@ -1,5 +1,6 @@
-import argparse
+﻿import argparse
 import json
+import logging
 import math
 import os
 import random
@@ -25,6 +26,8 @@ try:
 except Exception:
     pass
 
+
+logger = logging.getLogger("stopbuy-agent.predictor")
 
 TARGET_COLUMN = "구매후회값"
 RAW_NUMERIC_COLUMNS = [
@@ -124,14 +127,28 @@ def resolve_default_dataset_path() -> Path:
 DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "regret_model.pkl"
 DEFAULT_DATASET_PATH = resolve_default_dataset_path()
 DEFAULT_OPTIONS_PATH = Path(__file__).resolve().parent / "agent_options.json"
-LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")
+LLM_MODEL_NAME = os.getenv("PREFERENCE_LLM_MODEL_NAME") or os.getenv("LLM_MODEL_NAME", "gpt")
 LLM_PREFERENCE_TIMEOUT_SECONDS = float(os.getenv("LLM_PREFERENCE_TIMEOUT_SECONDS", "12"))
 LLM_PREFERENCE_BLEND_WEIGHT = float(os.getenv("LLM_PREFERENCE_BLEND_WEIGHT", "0.6"))
 LLM_PREFERENCE_ENABLED = os.getenv("LLM_PREFERENCE_ENABLED", "true").lower() not in {"0", "false", "no", "n"}
+LOCAL_LLM_MAX_NEW_TOKENS = int(os.getenv("LOCAL_LLM_MAX_NEW_TOKENS", "256"))
 DEFAULT_AGENT_OPTIONS = {
     "alternative_regret_score_threshold": 30,
     "max_alternative_products": 5,
 }
+
+LLM_MODEL_ALIASES = {
+    "gpt": {"provider": "openai", "model_id": "gpt-4o-mini-2024-07-18"},
+    "gemini": {"provider": "gemini", "model_id": "gemini-2.0-flash"},
+    "ax": {"provider": "local_hf", "model_id": "skt/A.X-4.0-Light"},
+    "exaone": {"provider": "local_hf", "model_id": "LGAI-EXAONE/EXAONE-4.0-1.2B"},
+    "kanana": {"provider": "local_hf", "model_id": "kakaocorp/kanana-1.5-8b-instruct-2505"},
+    "llama": {"provider": "local_hf", "model_id": "meta-llama/Llama-3.1-8B-Instruct"},
+    "mistral": {"provider": "local_hf", "model_id": "mistralai/Mistral-7B-Instruct-v0.2"},
+    "gemma": {"provider": "local_hf", "model_id": "google/gemma-3-4b-it"},
+    "deepseek": {"provider": "local_hf", "model_id": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"},
+}
+_LOCAL_TEXT_GENERATOR: Dict[str, Any] = {}
 
 PRODUCT_IMAGE_URLS = {
     "galaxy s24 fe": "https://fdn2.gsmarena.com/vv/bigpic/samsung-galaxy-s24-fe.jpg",
@@ -365,6 +382,40 @@ def clamp_unit(
     return max(0.0, min(1.0, safe_float(value)))
 
 
+## LLM이 숫자 대신 낸 정성 표현을 0~1 점수로 변환합니다.
+def coerce_llm_unit_score(
+    value: Any,
+    default: float = 0.5,
+) -> float:
+    if value is None:
+        return clamp_unit(default)
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        return clamp_unit(float(value))
+
+    text = str(value).strip().lower()
+    if not text:
+        return clamp_unit(default)
+    numeric = re.search(r"([0-9]+(?:\.[0-9]+)?)", text)
+    if numeric:
+        number = float(numeric.group(1))
+        if number > 1.0 and number <= 100.0:
+            number /= 100.0
+        return clamp_unit(number)
+
+    high_words = ["매우 적합", "아주 적합", "적합함", "높음", "강함", "high", "strong", "very suitable", "same"]
+    medium_words = ["보통", "중간", "부분", "medium", "partial", "somewhat"]
+    low_words = ["부적합", "낮음", "약함", "다름", "low", "weak", "different", "not"]
+    if any(word in text for word in high_words):
+        return 0.9
+    if any(word in text for word in medium_words):
+        return 0.55
+    if any(word in text for word in low_words):
+        return 0.1
+    return clamp_unit(default)
+
+
 ## 규칙 기반 적합도와 LLM 적합도를 가중 평균으로 결합합니다.
 def blend_llm_fit_score(
     rule_score: float,
@@ -375,6 +426,33 @@ def blend_llm_fit_score(
     llm_value = clamp_unit(safe_float(llm_score, rule_score))
     weight = clamp_unit(LLM_PREFERENCE_BLEND_WEIGHT)
     return clamp_unit(rule_score * (1.0 - weight) + llm_value * weight)
+
+
+## 규칙 기반 브랜드 비교와 LLM의 동일 브랜드 판별 결과를 결합합니다.
+def resolve_brand_fit_score(
+    preferred_tokens: set[str],
+    brand_tokens: set[str],
+    llm_scores: Optional[Dict[str, Any]] = None,
+) -> float:
+    if not preferred_tokens:
+        return 0.5
+
+    rule_score = 1.0 if preferred_tokens & brand_tokens else 0.0
+    if not llm_scores or not llm_scores.get("used_llm"):
+        return rule_score
+
+    confidence = clamp_unit(llm_scores.get("brand_confidence"))
+    same_brand = bool(llm_scores.get("same_brand"))
+    brand_fit = llm_scores.get("brand_fit")
+    if brand_fit is not None:
+        return max(rule_score, clamp_unit(brand_fit)) if confidence >= 0.6 else rule_score
+    if same_brand and confidence >= 0.8:
+        return 1.0
+    if same_brand and confidence >= 0.6:
+        return max(rule_score, 0.7)
+    if not same_brand and confidence >= 0.8:
+        return 0.0
+    return rule_score
 
 
 ## 입력 토큰과 상품 토큰의 단순 중첩 유사도를 계산합니다.
@@ -465,10 +543,7 @@ def purchase_decision_features(
 
     preferred_tokens = tokenize_preference_text(user.get("preferred_brands"))
     brand_tokens = tokenize_preference_text(product.get("brand"), product.get("name"))
-    if preferred_tokens:
-        brand_fit = 1.0 if preferred_tokens & brand_tokens else 0.0
-    else:
-        brand_fit = 0.5
+    brand_fit = resolve_brand_fit_score(preferred_tokens, brand_tokens, llm_scores)
 
     target_price = safe_float(product.get("target_price"))
     alternative_price = safe_float(product.get("best_alternative_price"))
@@ -579,51 +654,6 @@ def normalize_user_input_list(
     else:
         values = re.split(r"[,/|\n\t]+", str(value))
     return [str(item).strip() for item in values if str(item).strip()]
-
-
-## 사용자 구매조건이 비어 있으면 상품정보를 기준으로 예산과 선호브랜드를 보정합니다.
-def resolve_purchase_inputs(
-    user: Dict[str, Any],
-    product: Dict[str, Any],
-) -> Dict[str, Any]:
-    resolved_user = dict(user or {})
-    price = safe_float(product.get("price"))
-    budget = safe_float(resolved_user.get("budget"))
-    monthly_income = safe_float(resolved_user.get("monthly_income"))
-    preferred_brands = normalize_user_input_list(resolved_user.get("preferred_brands"))
-    product_brand = normalize_brand(product.get("brand"), product.get("name"))
-
-    if budget > 0:
-        budget_source = "user_input"
-    elif price > 0:
-        budget = price
-        budget_source = "product_price"
-    elif monthly_income > 0:
-        budget = monthly_income * 0.08
-        budget_source = "income_estimated"
-    else:
-        budget = 0.0
-        budget_source = "empty"
-    resolved_user["budget"] = budget
-
-    if preferred_brands:
-        preferred_brand_source = "user_input"
-    elif product_brand and product_brand != "기타":
-        preferred_brands = [product_brand]
-        preferred_brand_source = "product_brand"
-    else:
-        preferred_brand_source = "empty"
-    resolved_user["preferred_brands"] = preferred_brands
-
-    return {
-        "user": resolved_user,
-        "metadata": {
-            "budget": budget,
-            "budget_source": budget_source,
-            "preferred_brands": preferred_brands,
-            "preferred_brand_source": preferred_brand_source,
-        },
-    }
 
 
 ## Detect explicit risk words in product name, category, and description.
@@ -873,6 +903,181 @@ def extract_json_object(
         return {}
 
 
+## LLM 별칭을 실제 제공자와 모델 ID로 변환합니다.
+def resolve_llm_model_config(
+    model_name: Optional[str] = None,
+) -> Dict[str, str]:
+    requested = (model_name or LLM_MODEL_NAME or "gpt").strip()
+    lowered = requested.lower()
+    alias = LLM_MODEL_ALIASES.get(lowered)
+    if alias:
+        provider = str(alias["provider"])
+        model_id = os.getenv("LLM_BASE_MODEL_ID") or str(alias["model_id"])
+    elif lowered.startswith("hf:"):
+        provider = "local_hf"
+        model_id = requested[3:]
+    elif lowered.startswith("gemini"):
+        provider = "gemini"
+        model_id = os.getenv("LLM_BASE_MODEL_ID") or requested
+    else:
+        provider = "openai"
+        model_id = os.getenv("LLM_BASE_MODEL_ID") or requested
+    provider = os.getenv("LLM_PROVIDER", provider).strip().lower()
+    return {
+        "requested": requested,
+        "provider": provider,
+        "model_id": model_id,
+    }
+
+
+## OpenAI Chat Completions API로 JSON 응답을 생성합니다.
+def generate_openai_json(
+    prompt: str,
+    model_id: str,
+) -> str:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY가 필요합니다.")
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key, timeout=LLM_PREFERENCE_TIMEOUT_SECONDS)
+    response = client.chat.completions.create(
+        model=model_id,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": "당신은 상품 구매조건과 상품정보의 의미적 적합도를 보수적으로 평가하는 분석가입니다.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.choices[0].message.content or ""
+
+
+## Gemini API로 JSON 응답을 생성합니다.
+def generate_gemini_json(
+    prompt: str,
+    model_id: str,
+) -> str:
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY 또는 GOOGLE_API_KEY가 필요합니다.")
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model_id,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            response_mime_type="application/json",
+        ),
+    )
+    return response.text or ""
+
+
+## Hugging Face transformers 로컬 모델로 JSON 응답을 생성합니다.
+def generate_local_hf_json(
+    prompt: str,
+    model_id: str,
+) -> str:
+    cache_key = model_id
+    generator = _LOCAL_TEXT_GENERATOR.get(cache_key)
+    if generator is None:
+        from transformers import pipeline
+
+        trust_remote_code = os.getenv("LOCAL_LLM_TRUST_REMOTE_CODE", "true").lower() in {"1", "true", "yes", "y"}
+        logger.info("local LLM loading model: model_id=%s", model_id)
+        generator = pipeline(
+            "text-generation",
+            model=model_id,
+            torch_dtype="auto",
+            device_map="auto",
+            trust_remote_code=trust_remote_code,
+        )
+        _LOCAL_TEXT_GENERATOR[cache_key] = generator
+        logger.info("local LLM model loaded: model_id=%s", model_id)
+
+    messages = [
+        {
+            "role": "system",
+            "content": "당신은 상품 구매조건과 상품정보의 의미적 적합도를 보수적으로 평가하는 분석가입니다. 반드시 JSON 객체만 출력하세요.",
+        },
+        {"role": "user", "content": prompt},
+    ]
+    try:
+        tokenizer = generator.tokenizer
+        model_input = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    except Exception:
+        model_input = (
+            "시스템: 당신은 상품 구매조건과 상품정보의 의미적 적합도를 보수적으로 평가하는 분석가입니다. 반드시 JSON 객체만 출력하세요.\n"
+            f"사용자: {prompt}\n"
+            "응답:"
+        )
+    outputs = generator(
+        model_input,
+        max_new_tokens=LOCAL_LLM_MAX_NEW_TOKENS,
+        do_sample=False,
+        return_full_text=False,
+    )
+    if isinstance(outputs, list) and outputs:
+        return str(outputs[0].get("generated_text") or "")
+    return str(outputs or "")
+
+
+## 설정된 LLM 제공자에 따라 JSON 응답을 생성합니다.
+def generate_llm_json(
+    prompt: str,
+) -> Dict[str, Any]:
+    config = resolve_llm_model_config()
+    provider = config["provider"]
+    model_id = config["model_id"]
+    logger.info(
+        "preference LLM start: requested=%s provider=%s model_id=%s",
+        config["requested"],
+        provider,
+        model_id,
+    )
+    try:
+        if provider == "openai":
+            content = generate_openai_json(prompt, model_id)
+        elif provider == "gemini":
+            content = generate_gemini_json(prompt, model_id)
+        elif provider in {"local", "local_hf", "hf", "transformers"}:
+            content = generate_local_hf_json(prompt, model_id)
+        else:
+            raise RuntimeError(f"지원하지 않는 LLM 제공자입니다: {provider}")
+    except Exception:
+        logger.exception(
+            "preference LLM failed: requested=%s provider=%s model_id=%s",
+            config["requested"],
+            provider,
+            model_id,
+        )
+        raise
+    logger.info(
+        "preference LLM completed: requested=%s provider=%s model_id=%s response_length=%s",
+        config["requested"],
+        provider,
+        model_id,
+        len(content or ""),
+    )
+    parsed = extract_json_object(content)
+    if not parsed:
+        logger.warning(
+            "preference LLM returned non-json output: requested=%s provider=%s model_id=%s raw=%s",
+            config["requested"],
+            provider,
+            model_id,
+            str(content or "")[:800],
+        )
+    parsed["_llm_config"] = config
+    return parsed
+
+
 ## LLM을 이용해 사용목적과 중요요소가 상품 정보와 의미적으로 맞는지 평가합니다.
 def evaluate_preference_fit_with_llm(
     user: Dict[str, Any],
@@ -880,13 +1085,11 @@ def evaluate_preference_fit_with_llm(
 ) -> Dict[str, Any]:
     if not LLM_PREFERENCE_ENABLED:
         return {"used_llm": False, "reason": "disabled"}
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        return {"used_llm": False, "reason": "missing_api_key"}
 
     usage_purpose = str(user.get("usage_purpose") or "").strip()
     important_factors = normalize_user_input_list(user.get("important_factors"))
-    if not usage_purpose and not important_factors:
+    preferred_brands = normalize_user_input_list(user.get("preferred_brands"))
+    if not usage_purpose and not important_factors and not preferred_brands:
         return {"used_llm": False, "reason": "empty_preference_input"}
 
     product_payload = {
@@ -902,49 +1105,50 @@ def evaluate_preference_fit_with_llm(
     user_payload = {
         "사용목적": usage_purpose,
         "중요요소": important_factors,
-        "선호브랜드": normalize_user_input_list(user.get("preferred_brands")),
+        "선호브랜드": preferred_brands,
         "예산": user.get("budget"),
     }
     prompt = (
         "사용자의 구매조건과 상품정보를 비교해 의미적 적합도를 평가하세요. "
-        "가격이나 예산 초과 여부는 판단하지 말고, 사용목적과 중요요소가 상품명, 브랜드, 카테고리, 상품설명과 얼마나 맞는지만 평가하세요. "
-        "점수는 0.0부터 1.0 사이 숫자로 작성하고, 반드시 JSON 객체만 반환하세요.\n\n"
+        "가격이나 예산 초과 여부는 판단하지 마세요. "
+        "사용목적과 중요요소는 상품명, 브랜드, 카테고리, 상품설명과 얼마나 맞는지 평가하세요. "
+        "선호브랜드는 상품 브랜드/상품명이 같은 브랜드, 같은 회사, 공식 영문명/한글명, 제품라인 관계로 볼 수 있는지 판별하세요. "
+        "점수와 신뢰도는 0.0부터 1.0 사이 숫자로 작성하고, 반드시 JSON 객체만 반환하세요. "
+        "evidence는 짧은 문장 1개만 작성하고 JSON을 반드시 닫으세요.\n\n"
         f"사용자 입력:\n{json.dumps(user_payload, ensure_ascii=False, indent=2)}\n\n"
         f"상품 정보:\n{json.dumps(product_payload, ensure_ascii=False, indent=2)}\n\n"
         "반환 형식:\n"
         "{\n"
         '  "usage_purpose_fit": 0.0,\n'
         '  "important_factor_fit": 0.0,\n'
+        '  "same_brand": false,\n'
+        '  "brand_confidence": 0.0,\n'
+        '  "brand_fit": 0.0,\n'
+        '  "brand_relationship": "same_company|same_brand|product_line|different|unknown",\n'
         '  "evidence": ["근거 1", "근거 2"]\n'
         "}"
     )
 
     try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key, timeout=LLM_PREFERENCE_TIMEOUT_SECONDS)
-        response = client.chat.completions.create(
-            model=LLM_MODEL_NAME,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": "당신은 상품 구매조건과 상품정보의 의미적 적합도를 보수적으로 평가하는 분석가입니다.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-        )
-        content = response.choices[0].message.content or ""
-        parsed = extract_json_object(content)
-        if "usage_purpose_fit" not in parsed and "important_factor_fit" not in parsed:
+        parsed = generate_llm_json(prompt)
+        llm_config = parsed.pop("_llm_config", resolve_llm_model_config())
+        if "usage_purpose_fit" not in parsed and "important_factor_fit" not in parsed and "same_brand" not in parsed:
             return {"used_llm": False, "reason": "empty_llm_scores"}
+        same_brand = parsed.get("same_brand")
+        if isinstance(same_brand, str):
+            same_brand = same_brand.strip().lower() in {"true", "yes", "y", "1", "same", "동일"}
         return {
             "used_llm": True,
-            "usage_purpose_fit": clamp_unit(parsed.get("usage_purpose_fit", 0.5)),
-            "important_factor_fit": clamp_unit(parsed.get("important_factor_fit", 0.5)),
-            "evidence": parsed.get("evidence") if isinstance(parsed.get("evidence"), list) else [],
-            "model": LLM_MODEL_NAME,
+            "usage_purpose_fit": coerce_llm_unit_score(parsed.get("usage_purpose_fit"), 0.5),
+            "important_factor_fit": coerce_llm_unit_score(parsed.get("important_factor_fit"), 0.5),
+            "same_brand": bool(same_brand),
+            "brand_confidence": coerce_llm_unit_score(parsed.get("brand_confidence"), 0.0),
+            "brand_fit": coerce_llm_unit_score(parsed.get("brand_fit"), 0.5),
+            "brand_relationship": str(parsed.get("brand_relationship") or "unknown"),
+            "evidence": parsed.get("evidence") if isinstance(parsed.get("evidence"), list) else ([str(parsed.get("evidence"))] if parsed.get("evidence") else []),
+            "model": llm_config["model_id"],
+            "model_name": llm_config["requested"],
+            "provider": llm_config["provider"],
         }
     except Exception as exc:
         return {"used_llm": False, "reason": f"llm_error: {exc}"}
@@ -961,10 +1165,12 @@ def preference_alignment(
     preferred_tokens = tokenize_preference_text(user.get("preferred_brands"))
     factor_tokens = tokenize_preference_text(user.get("important_factors"))
     purpose_tokens = tokenize_preference_text(user.get("usage_purpose"))
+    llm_scores = product.get("llm_preference_scores") or {}
     budget_factor_tokens = {"price", "budget", "cheap", "value", "가격", "예산", "가성비", "저렴"}
     condition_tokens = (factor_tokens - budget_factor_tokens) | purpose_tokens
 
-    matched_preferred = bool(preferred_tokens & brand_tokens)
+    brand_fit = resolve_brand_fit_score(preferred_tokens, brand_tokens, llm_scores)
+    matched_preferred = bool(preferred_tokens) and brand_fit >= 0.8
     condition_matches = condition_tokens & product_tokens
     condition_similarity = (
         len(condition_matches) / max(len(condition_tokens), 1)
@@ -1028,6 +1234,8 @@ def preference_alignment(
         "condition_similarity": round(condition_similarity, 4),
         "matched_tokens": sorted(condition_matches),
         "matched_preferred_brand": matched_preferred,
+        "brand_fit": round(brand_fit, 4),
+        "brand_match_source": "llm" if llm_scores.get("used_llm") and safe_float(llm_scores.get("brand_confidence")) >= 0.6 else "rule",
         "reasons": reasons,
     }
 
@@ -1607,18 +1815,15 @@ class RegretPredictor:
             "image_url": product.get("image_url"),
             "source_url": product.get("source_url"),
         }
-        resolved_inputs = resolve_purchase_inputs(user, normalized_product)
-        resolved_user = resolved_inputs["user"]
-        score_result = self._predict_score(resolved_user, normalized_product)
+        score_result = self._predict_score(user, normalized_product)
         regret_score = score_result["regret_score"]
         alternatives = []
         if regret_score >= self.threshold:
-            alternatives = self.recommend_alternatives(resolved_user, normalized_product, regret_score)
+            alternatives = self.recommend_alternatives(user, normalized_product, regret_score)
 
         return {
             "product": normalized_product,
             "product_name": normalized_product["name"],
-            "resolved_inputs": resolved_inputs["metadata"],
             "regret_score": round(regret_score, 4),
             "regret_level": regret_level(regret_score),
             "model_regret_score": round(score_result["model_regret_score"], 4),

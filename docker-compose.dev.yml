@@ -5,6 +5,7 @@ services:
     image: stopbuy2-agent:dev
     container_name: stopbuy2_agent_dev
     command: ["watchfiles", "python server.py", "/app"]
+    gpus: all
     environment:
       AGENT_HOST: 0.0.0.0
       AGENT_PORT: 8765
@@ -13,11 +14,17 @@ services:
       REGRET_DATASET_PATH: /app/datas/purchase_regret_training_dataset_source.xlsx
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       LLM_MODEL_NAME: ${LLM_MODEL_NAME:-gpt-4o-mini}
+      HF_HOME: /root/.cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /root/.cache/huggingface/hub
+      LOCAL_LLM_TRUST_REMOTE_CODE: "true"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
       LOG_PAYLOAD_MAX_LENGTH: 0
       NAVER_LOG_PAYLOAD_MAX_LENGTH: 0
     volumes:
       - ./agent:/app
       - ./datas:/app/datas:ro
+      - hf_cache:/root/.cache/huggingface
     healthcheck:
       test: ["CMD", "python", "-c", "from websockets.sync.client import connect; ws=connect('ws://127.0.0.1:8765', open_timeout=3); ws.close()"]
       interval: 10s
@@ -33,7 +40,7 @@ services:
     command: ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app/backend"]
     environment:
       AGENT_WS_URL: ws://agent:8765
-      AGENT_TIMEOUT: 120
+      AGENT_TIMEOUT: 600
       LOG_LEVEL: INFO
       LOG_PAYLOAD_MAX_LENGTH: 0
     ports:
@@ -77,3 +84,4 @@ services:
 
 volumes:
   frontend_node_modules:
+  hf_cache:

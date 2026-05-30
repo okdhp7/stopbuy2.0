@@ -16,7 +16,7 @@ from env_loader import load_dotenv
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")
+LLM_MODEL_NAME = os.getenv("VISION_LLM_MODEL_NAME", "gpt-4o-mini")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET")
 NAVER_SHOPPING_DISPLAY = int(os.getenv("NAVER_SHOPPING_DISPLAY", "10"))
@@ -357,14 +357,14 @@ def parse_count_value(
     if isinstance(value, (int, float)):
         return max(0, int(value))
     text = str(value).replace(",", "").strip()
-    match = re.search(r"(\d+(?:\.\d+)?)\s*(?|?|k|K)?", text)
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(만|천|k|K)?", text)
     if not match:
         return None
     number = float(match.group(1))
     unit = match.group(2)
-    if unit == "?":
+    if unit == "만":
         number *= 10000
-    elif unit == "?" or unit in {"k", "K"}:
+    elif unit == "천" or unit in {"k", "K"}:
         number *= 1000
     return max(0, int(number))
 

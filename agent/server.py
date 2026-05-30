@@ -12,7 +12,7 @@ from env_loader import load_dotenv
 load_dotenv()
 
 from product_extractor import extract_product_candidates_from_image, extract_product_info
-from predictor import RegretPredictor
+from predictor import RegretPredictor, resolve_llm_model_config
 
 
 logging.basicConfig(
@@ -92,8 +92,22 @@ async def handle_request(ws: ServerConnection, session_id: str, data: Dict[str, 
 
         await send_progress(ws, session_id, 25, "상품 정보를 추출하고 있습니다.")
         product = await extract_product_info(data)
+        if data.get("input_type") == "manual" and isinstance(product, dict):
+            has_rating = product.get("rating") not in (None, "")
+            has_review_count = product.get("review_count") not in (None, "")
+            if has_rating or has_review_count:
+                product["review_data_available"] = True
 
-        await send_progress(ws, session_id, 55, "구매 후회 가능성을 예측하고 있습니다.")
+        llm_config = resolve_llm_model_config()
+        if llm_config.get("provider") in {"local", "local_hf", "hf", "transformers"}:
+            await send_progress(
+                ws,
+                session_id,
+                55,
+                f"로컬 LLM 모델을 로딩하고 있습니다. 최초 실행은 오래 걸릴 수 있습니다. ({llm_config.get('model_id')})",
+            )
+        else:
+            await send_progress(ws, session_id, 55, "구매 후회 가능성을 예측하고 있습니다.")
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,

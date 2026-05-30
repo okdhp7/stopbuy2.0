@@ -90,15 +90,20 @@ export function ProductInputForm({ onSubmit, isAnalyzing }: ProductInputFormProp
     usage_purpose: usagePurpose || undefined,
   });
 
-  const buildProductInfo = (): ProductInfo => ({
-    name: productName || undefined,
-    brand: productBrand || undefined,
-    category: productCategory || undefined,
-    price: productPrice ? parseFloat(productPrice.replace(/,/g, "")) : undefined,
-    rating: productRating ? parseFloat(productRating) : undefined,
-    review_count: productReviewCount ? parseInt(productReviewCount) : undefined,
-    return_rate: productReturnRate ? parseFloat(productReturnRate) : undefined,
-  });
+  const buildProductInfo = (): ProductInfo => {
+    const hasRating = productRating.trim().length > 0;
+    const hasReviewCount = productReviewCount.trim().length > 0;
+    return {
+      name: productName || undefined,
+      brand: productBrand || undefined,
+      category: productCategory || undefined,
+      price: productPrice ? parseFloat(productPrice.replace(/,/g, "")) : undefined,
+      rating: hasRating ? parseFloat(productRating) : undefined,
+      review_count: hasReviewCount ? parseInt(productReviewCount, 10) : undefined,
+      review_data_available: hasRating || hasReviewCount,
+      return_rate: productReturnRate ? parseFloat(productReturnRate) : undefined,
+    };
+  };
 
   const handleSubmit = () => {
     const user = buildUserProfile();

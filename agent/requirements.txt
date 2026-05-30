@@ -9,6 +9,10 @@ scikit-learn==1.5.2
 lightgbm==4.5.0
 joblib==1.4.2
 openai==1.57.0
+google-genai==1.18.0
+transformers>=4.53.0
+accelerate==1.7.0
+sentencepiece==0.2.0
 watchfiles==0.24.0
 --extra-index-url https://download.pytorch.org/whl/cu126
 torch
