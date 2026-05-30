@@ -5,6 +5,7 @@ import math
 import os
 import random
 import re
+import threading
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -132,6 +133,7 @@ LLM_PREFERENCE_TIMEOUT_SECONDS = float(os.getenv("LLM_PREFERENCE_TIMEOUT_SECONDS
 LLM_PREFERENCE_BLEND_WEIGHT = float(os.getenv("LLM_PREFERENCE_BLEND_WEIGHT", "0.6"))
 LLM_PREFERENCE_ENABLED = os.getenv("LLM_PREFERENCE_ENABLED", "true").lower() not in {"0", "false", "no", "n"}
 LOCAL_LLM_MAX_NEW_TOKENS = int(os.getenv("LOCAL_LLM_MAX_NEW_TOKENS", "256"))
+PREFERENCE_LLM_WARMUP_ENABLED = os.getenv("PREFERENCE_LLM_WARMUP_ENABLED", "true").lower() not in {"0", "false", "no", "n"}
 DEFAULT_AGENT_OPTIONS = {
     "alternative_regret_score_threshold": 30,
     "max_alternative_products": 5,
@@ -149,6 +151,7 @@ LLM_MODEL_ALIASES = {
     "deepseek": {"provider": "local_hf", "model_id": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"},
 }
 _LOCAL_TEXT_GENERATOR: Dict[str, Any] = {}
+_LOCAL_TEXT_GENERATOR_LOCK = threading.Lock()
 
 PRODUCT_IMAGE_URLS = {
     "galaxy s24 fe": "https://fdn2.gsmarena.com/vv/bigpic/samsung-galaxy-s24-fe.jpg",
@@ -979,14 +982,20 @@ def generate_gemini_json(
     return response.text or ""
 
 
-## Hugging Face transformers 로컬 모델로 JSON 응답을 생성합니다.
-def generate_local_hf_json(
-    prompt: str,
+## Hugging Face transformers 로컬 모델을 로딩하고 프로세스 캐시에 저장합니다.
+def load_local_hf_generator(
     model_id: str,
-) -> str:
+) -> Any:
     cache_key = model_id
     generator = _LOCAL_TEXT_GENERATOR.get(cache_key)
-    if generator is None:
+    if generator is not None:
+        return generator
+
+    with _LOCAL_TEXT_GENERATOR_LOCK:
+        generator = _LOCAL_TEXT_GENERATOR.get(cache_key)
+        if generator is not None:
+            return generator
+
         from transformers import pipeline
 
         trust_remote_code = os.getenv("LOCAL_LLM_TRUST_REMOTE_CODE", "true").lower() in {"1", "true", "yes", "y"}
@@ -1000,7 +1009,15 @@ def generate_local_hf_json(
         )
         _LOCAL_TEXT_GENERATOR[cache_key] = generator
         logger.info("local LLM model loaded: model_id=%s", model_id)
+        return generator
 
+
+## Hugging Face transformers 로컬 모델로 JSON 응답을 생성합니다.
+def generate_local_hf_json(
+    prompt: str,
+    model_id: str,
+) -> str:
+    generator = load_local_hf_generator(model_id)
     messages = [
         {
             "role": "system",
@@ -1026,6 +1043,42 @@ def generate_local_hf_json(
     if isinstance(outputs, list) and outputs:
         return str(outputs[0].get("generated_text") or "")
     return str(outputs or "")
+
+
+## 설정에 따라 agent 시작 시점에 로컬 LLM 모델을 미리 로딩합니다.
+def warm_up_preference_llm() -> Dict[str, Any]:
+    config = resolve_llm_model_config()
+    provider = config["provider"]
+    model_id = config["model_id"]
+    if not LLM_PREFERENCE_ENABLED:
+        logger.info("preference LLM warm-up skipped: disabled")
+        return {**config, "warmed": False, "reason": "disabled"}
+    if not PREFERENCE_LLM_WARMUP_ENABLED:
+        logger.info("preference LLM warm-up skipped: warm-up disabled")
+        return {**config, "warmed": False, "reason": "warmup_disabled"}
+    if provider not in {"local", "local_hf", "hf", "transformers"}:
+        logger.info(
+            "preference LLM warm-up skipped: requested=%s provider=%s model_id=%s",
+            config["requested"],
+            provider,
+            model_id,
+        )
+        return {**config, "warmed": False, "reason": "not_local_llm"}
+
+    logger.info(
+        "preference LLM warm-up start: requested=%s provider=%s model_id=%s",
+        config["requested"],
+        provider,
+        model_id,
+    )
+    load_local_hf_generator(model_id)
+    logger.info(
+        "preference LLM warm-up completed: requested=%s provider=%s model_id=%s",
+        config["requested"],
+        provider,
+        model_id,
+    )
+    return {**config, "warmed": True}
 
 
 ## 설정된 LLM 제공자에 따라 JSON 응답을 생성합니다.

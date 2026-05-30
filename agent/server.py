@@ -12,7 +12,7 @@ from env_loader import load_dotenv
 load_dotenv()
 
 from product_extractor import extract_product_candidates_from_image, extract_product_info
-from predictor import RegretPredictor, resolve_llm_model_config
+from predictor import RegretPredictor, resolve_llm_model_config, warm_up_preference_llm
 
 
 logging.basicConfig(
@@ -27,6 +27,7 @@ REGRET_THRESHOLD = float(os.getenv("REGRET_THRESHOLD", "0.4"))
 LOG_PAYLOAD_MAX_LENGTH = int(os.getenv("LOG_PAYLOAD_MAX_LENGTH", "4000"))
 MODEL_PATH = os.getenv("REGRET_MODEL_PATH")
 DATASET_PATH = os.getenv("REGRET_DATASET_PATH")
+PREFERENCE_LLM_WARMUP_REQUIRED = os.getenv("PREFERENCE_LLM_WARMUP_REQUIRED", "false").lower() in {"1", "true", "yes", "y"}
 
 predictor = RegretPredictor(
     model_path=MODEL_PATH,
@@ -158,6 +159,21 @@ async def handle_client(ws: ServerConnection) -> None:
 
 
 async def main() -> None:
+    loop = asyncio.get_running_loop()
+    try:
+        warmup_result = await loop.run_in_executor(None, warm_up_preference_llm)
+        if warmup_result.get("warmed"):
+            logger.info(
+                "preference LLM is ready: requested=%s provider=%s model_id=%s",
+                warmup_result.get("requested"),
+                warmup_result.get("provider"),
+                warmup_result.get("model_id"),
+            )
+    except Exception:
+        logger.exception("preference LLM warm-up failed")
+        if PREFERENCE_LLM_WARMUP_REQUIRED:
+            raise
+
     logger.info("StopBuy2.0 Agent listening on ws://%s:%s", AGENT_HOST, AGENT_PORT)
     async with serve(handle_client, AGENT_HOST, AGENT_PORT, ping_interval=20, ping_timeout=10):
         await asyncio.Future()

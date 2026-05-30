@@ -4,8 +4,8 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from typing import Any, Dict, List, Optional, Set
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -36,6 +36,36 @@ CATEGORY_KEYWORDS = {
     "생활가전": ["청소기", "냉장고", "세탁기", "공기청정기", "vacuum", "washer"],
 }
 
+GENERIC_URL_PRODUCT_NAMES = {"URL 입력 상품", "상품", "product", "unknown", "null"}
+BRAND_KEYWORDS = {
+    "삼성": ["삼성", "삼성전자", "samsung", "galaxy", "갤럭시"],
+    "애플": ["애플", "apple", "iphone", "아이폰", "ipad", "아이패드", "macbook", "맥북", "airpods", "에어팟"],
+    "LG": ["lg", "엘지", "lg전자", "gram", "그램"],
+    "소니": ["sony", "소니"],
+    "레노버": ["lenovo", "레노버"],
+    "샤오미": ["xiaomi", "샤오미", "redmi", "레드미"],
+    "구글": ["google", "구글", "pixel", "픽셀"],
+    "HP": ["hp", "hpe", "hewlett", "proliant", "휴렛팩커드"],
+    "델": ["dell", "델", "xps"],
+    "ASUS": ["asus", "에이수스", "젠북", "zenbook"],
+    "Bose": ["bose", "보스"],
+    "JBL": ["jbl"],
+    "필립스": ["필립스", "philips"],
+    "브라운": ["브라운", "braun"],
+    "파나소닉": ["파나소닉", "panasonic"],
+}
+BRAND_SLUG_ALIASES = {
+    "philips": "필립스",
+    "samsung": "삼성",
+    "apple": "애플",
+    "lg": "LG",
+    "sony": "소니",
+    "braun": "브라운",
+    "panasonic": "파나소닉",
+    "xiaomi": "샤오미",
+    "lenovo": "레노버",
+}
+
 
 ## 문자열의 연속 공백을 정리하고 비어 있으면 None을 반환합니다.
 def _clean_text(
@@ -57,6 +87,131 @@ def _number_from_text(
         return float(match.group(1).replace(",", ""))
     except ValueError:
         return None
+
+
+## HTML 메타 태그에서 후보 속성명에 해당하는 content 값을 찾습니다.
+def get_meta_content(
+    soup: BeautifulSoup,
+    *names: str,
+) -> Optional[str]:
+    for name in names:
+        tag = (
+            soup.find("meta", property=name)
+            or soup.find("meta", attrs={"name": name})
+            or soup.find("meta", attrs={"itemprop": name})
+        )
+        if tag and tag.get("content"):
+            return _clean_text(tag.get("content"))
+    return None
+
+
+## 상품명에 붙은 쇼핑몰/페이지 부가 문구를 제거합니다.
+def clean_product_title(
+    value: Optional[str],
+) -> Optional[str]:
+    text = _clean_text(value)
+    if not text:
+        return None
+    for separator in [" : 네이버쇼핑", " - 네이버쇼핑", " | 네이버", " | 쿠팡", " - 쿠팡", " - 11번가", " - G마켓"]:
+        text = text.replace(separator, "")
+    text = re.sub(r"\s*[-|:]\s*(스마트스토어|네이버\s*쇼핑|쿠팡|11번가|G마켓|옥션)\s*$", "", text, flags=re.IGNORECASE)
+    return _clean_text(text)
+
+
+## 상품명/브랜드 텍스트에서 대표 브랜드명을 추론합니다.
+def infer_brand_from_text(
+    *values: Any,
+) -> Optional[str]:
+    source = " ".join(str(value) for value in values if value).lower()
+    if not source:
+        return None
+    for brand, keywords in BRAND_KEYWORDS.items():
+        if any(keyword.lower() in source for keyword in keywords):
+            return brand
+    return None
+
+
+## 네이버 브랜드스토어/스마트스토어 URL에서 브랜드 슬러그와 상품 ID를 추출합니다.
+def extract_naver_store_url_info(
+    url: str,
+) -> Dict[str, Optional[str]]:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path_parts = [unquote(part) for part in parsed.path.split("/") if part]
+    result: Dict[str, Optional[str]] = {"brand_slug": None, "brand": None, "product_id": None}
+    if "brand.naver.com" not in host and "smartstore.naver.com" not in host:
+        return result
+
+    if path_parts:
+        slug = path_parts[0].strip()
+        if slug.lower() not in {"main", "products", "product"}:
+            result["brand_slug"] = slug
+            result["brand"] = BRAND_SLUG_ALIASES.get(slug.lower()) or infer_brand_from_text(slug)
+
+    for index, part in enumerate(path_parts):
+        if part.lower() in {"products", "product"} and index + 1 < len(path_parts):
+            product_id = path_parts[index + 1]
+            if product_id.isdigit():
+                result["product_id"] = product_id
+                break
+    return result
+
+
+## URL의 검색 쿼리와 경로에서 상품 검색에 쓸 후보 문구를 추출합니다.
+def extract_url_query_hint(
+    url: str,
+) -> Optional[str]:
+    parsed = urlparse(url)
+    query_values = parse_qs(parsed.query)
+    for key in ("nl-query", "query", "q", "keyword", "search", "searchKeyword"):
+        values = query_values.get(key)
+        if values:
+            cleaned = clean_product_title(unquote(str(values[0])))
+            if cleaned:
+                return cleaned
+
+    naver_info = extract_naver_store_url_info(url)
+    if naver_info.get("brand"):
+        return naver_info["brand"]
+
+    path_parts = [unquote(part) for part in parsed.path.split("/") if part]
+    meaningful_parts = [
+        part
+        for part in path_parts
+        if not part.isdigit()
+        and part.lower() not in {"products", "product", "catalog", "main", "smartstore"}
+    ]
+    if meaningful_parts:
+        return clean_product_title(" ".join(meaningful_parts[:3]))
+    return None
+
+
+## URL 추출 결과가 기본값 수준인지 판단합니다.
+def is_generic_product_name(
+    value: Any,
+) -> bool:
+    text = str(value or "").strip()
+    return not text or text in GENERIC_URL_PRODUCT_NAMES
+
+
+## 검색/병합 품질 평가에 사용할 토큰 집합을 만듭니다.
+def text_tokens(
+    *values: Any,
+) -> Set[str]:
+    text = " ".join(str(value) for value in values if value).lower()
+    return {token for token in re.split(r"[^0-9a-zA-Z가-힣]+", text) if len(token) >= 2}
+
+
+## 두 상품 텍스트의 단순 토큰 유사도를 계산합니다.
+def token_similarity(
+    left: Any,
+    right: Any,
+) -> float:
+    left_tokens = text_tokens(left)
+    right_tokens = text_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / max(len(left_tokens | right_tokens), 1)
 
 
 ## 상품명/설명 텍스트에서 키워드 기반으로 상품 카테고리를 추론합니다.
@@ -103,7 +258,8 @@ def parse_json_ld(
                 if isinstance(graph, list):
                     candidates.extend(graph)
                     continue
-                if item.get("@type") not in ("Product", ["Product"]):
+                item_type = item.get("@type")
+                if item_type != "Product" and not (isinstance(item_type, list) and "Product" in item_type):
                     continue
                 result: Dict[str, Any] = {}
                 if item.get("name"):
@@ -140,6 +296,292 @@ def parse_json_ld(
     return {}
 
 
+## 중첩된 스크립트 JSON에서 상품명/브랜드/가격 후보를 재귀적으로 찾습니다.
+def collect_product_values(
+    value: Any,
+    result: Dict[str, Any],
+) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if result.get("name") is None and lowered in {"name", "productname", "product_name", "producttitle", "title"} and isinstance(item, (str, int, float)):
+                cleaned = clean_product_title(clean_shopping_text(str(item)))
+                if cleaned and len(cleaned) >= 2:
+                    result["name"] = cleaned
+            if result.get("brand") is None and lowered in {"brand", "brandname", "brand_name", "maker", "manufacturer"}:
+                if isinstance(item, dict):
+                    item = item.get("name") or item.get("brandName")
+                cleaned = clean_shopping_text(str(item)) if isinstance(item, (str, int, float)) else None
+                if cleaned and len(cleaned) >= 2:
+                    result["brand"] = cleaned
+            if result.get("price") is None and lowered in {"price", "saleprice", "discountprice", "lprice", "lowprice"} and isinstance(item, (str, int, float)):
+                price = _number_from_text(str(item))
+                if price:
+                    result["price"] = price
+            if result.get("image_url") is None and lowered in {"image", "imageurl", "representimageurl", "thumbnail", "thumbnailurl"}:
+                if isinstance(item, list) and item:
+                    item = item[0]
+                if isinstance(item, str) and item.startswith(("http://", "https://")):
+                    result["image_url"] = item
+            if result.get("description") is None and lowered in {"description", "productdescription", "desc"} and isinstance(item, (str, int, float)):
+                cleaned = clean_shopping_text(str(item))
+                if cleaned and len(cleaned) >= 10:
+                    result["description"] = cleaned[:500]
+            collect_product_values(item, result)
+    elif isinstance(value, list):
+        for item in value:
+            collect_product_values(item, result)
+
+
+## Next.js와 일반 스크립트 JSON에서 상품 후보 정보를 추출합니다.
+def parse_script_product_data(
+    soup: BeautifulSoup,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {"name": None, "brand": None, "price": None, "image_url": None, "description": None}
+    script_candidates = []
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    if next_data and next_data.string:
+        script_candidates.append(next_data.string)
+    for script in soup.find_all("script", type="application/json"):
+        if script.string:
+            script_candidates.append(script.string)
+
+    for text in script_candidates[:8]:
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            continue
+        collect_product_values(parsed, result)
+        if result.get("name") and result.get("brand") and result.get("price"):
+            break
+    return {key: item for key, item in result.items() if item not in (None, "")}
+
+
+## URL 추출 결과와 네이버 쇼핑 후보를 병합해 부족한 상품 정보를 보강합니다.
+def merge_naver_candidate(
+    product: Dict[str, Any],
+    candidate: Dict[str, Any],
+) -> Dict[str, Any]:
+    merged = dict(product)
+    should_replace_name = (
+        is_generic_product_name(merged.get("name"))
+        or bool(merged.get("name_from_url_hint"))
+        or str(merged.get("name") or "").strip() == str(merged.get("url_query") or "").strip()
+    )
+    if should_replace_name and candidate.get("name"):
+        merged["name"] = candidate["name"]
+        merged["name_from_url_hint"] = False
+    if not merged.get("brand") and candidate.get("brand"):
+        merged["brand"] = candidate["brand"]
+    if not merged.get("category") and candidate.get("category"):
+        merged["category"] = candidate["category"]
+    if not merged.get("image_url") and candidate.get("image_url"):
+        merged["image_url"] = candidate["image_url"]
+    if not merged.get("price") and candidate.get("price"):
+        merged["price"] = candidate["price"]
+    if not merged.get("rating") and candidate.get("rating") is not None:
+        merged["rating"] = candidate["rating"]
+    if not merged.get("review_count") and candidate.get("review_count") is not None:
+        merged["review_count"] = candidate["review_count"]
+    if candidate.get("review_data_available"):
+        merged["review_data_available"] = True
+        merged["review_source"] = candidate.get("review_source")
+        merged["review_texts"] = candidate.get("review_texts") or []
+    merged["naver_enriched"] = True
+    merged["naver_candidate"] = {
+        "name": candidate.get("name"),
+        "brand": candidate.get("brand"),
+        "price": candidate.get("price"),
+        "source_url": candidate.get("source_url"),
+        "mall_name": candidate.get("mall_name"),
+    }
+    return merged
+
+
+## URL 추출 결과를 기반으로 네이버 쇼핑 검색어를 구성합니다.
+def build_url_search_query(
+    product: Dict[str, Any],
+) -> str:
+    candidates = [
+        product.get("url_query"),
+        product.get("brand"),
+        None if is_generic_product_name(product.get("name")) else product.get("name"),
+        product.get("category"),
+        product.get("description"),
+    ]
+    query = " ".join(str(value).strip() for value in candidates if value)
+    tokens = [token for token in re.split(r"\s+", query) if token and token.lower() not in {"url", "상품", "입력", "product"}]
+    return " ".join(tokens[:10])
+
+
+## 네이버 쇼핑 API 결과 중 URL 추출 상품과 가장 유사한 후보를 선택합니다.
+async def enrich_product_with_naver_search(
+    product: Dict[str, Any],
+) -> Dict[str, Any]:
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        return product
+    query = build_url_search_query(product)
+    if not query:
+        return product
+    try:
+        candidates = await search_naver_shopping(query, min(NAVER_SHOPPING_DISPLAY, 5))
+    except Exception as exc:
+        logger.info("url naver enrichment failed: query=%s error=%s", query, exc)
+        return product
+    if not candidates:
+        return product
+
+    reference_text = " ".join(
+        str(value)
+        for value in [
+            product.get("url_query"),
+            None if is_generic_product_name(product.get("name")) else product.get("name"),
+            product.get("brand"),
+        ]
+        if value
+    )
+    best_candidate = max(
+        candidates,
+        key=lambda item: token_similarity(
+            reference_text,
+            f"{item.get('name', '')} {item.get('brand', '')}",
+        ),
+    )
+    score = token_similarity(
+        reference_text,
+        f"{best_candidate.get('name', '')} {best_candidate.get('brand', '')}",
+    )
+    if score < 0.05 and not is_generic_product_name(product.get("name")) and not product.get("name_from_url_hint"):
+        return product
+    enriched = merge_naver_candidate(product, best_candidate)
+    enriched["naver_enrichment_query"] = query
+    enriched["naver_enrichment_score"] = round(score, 4)
+    logger.info(
+        "url product enriched by naver: %s",
+        json.dumps({
+            "query": query,
+            "score": enriched["naver_enrichment_score"],
+            "name": enriched.get("name"),
+            "brand": enriched.get("brand"),
+            "price": enriched.get("price"),
+        }, ensure_ascii=False, indent=2, default=str),
+    )
+    return enriched
+
+
+## URL 페이지에서 뽑은 텍스트를 LLM으로 정리해 부족한 상품명/브랜드를 보강합니다.
+async def enrich_product_with_llm(
+    product: Dict[str, Any],
+    page_text: str,
+) -> Dict[str, Any]:
+    if not OPENAI_API_KEY:
+        return product
+    if not is_generic_product_name(product.get("name")) and product.get("brand"):
+        return product
+
+    try:
+        from openai import AsyncOpenAI
+
+        payload = {
+            "현재상품정보": {
+                "name": product.get("name"),
+                "brand": product.get("brand"),
+                "category": product.get("category"),
+                "price": product.get("price"),
+                "description": product.get("description"),
+                "source_url": product.get("source_url"),
+            },
+            "페이지텍스트": page_text[:4000],
+        }
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        response = await client.chat.completions.create(
+            model=LLM_MODEL_NAME,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": "당신은 쇼핑몰 URL 페이지에서 상품명과 브랜드를 보수적으로 추출하는 분석가입니다. 반드시 JSON 객체만 출력하세요.",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "아래 정보에서 실제 판매 상품의 name, brand, category, price, description을 추출하세요. "
+                        "확실하지 않은 값은 null로 두세요.\n"
+                        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+                    ),
+                },
+            ],
+        )
+        parsed = json.loads(response.choices[0].message.content or "{}")
+    except Exception as exc:
+        logger.info("url llm enrichment failed: error=%s", exc)
+        return product
+
+    enriched = dict(product)
+    for key in ("name", "brand", "category", "description"):
+        value = clean_shopping_text(str(parsed.get(key))) if parsed.get(key) is not None else None
+        if value and (not enriched.get(key) or (key == "name" and is_generic_product_name(enriched.get("name")))):
+            enriched[key] = value
+    if not enriched.get("price") and parsed.get("price") is not None:
+        enriched["price"] = _number_from_text(str(parsed.get("price"))) or enriched.get("price")
+    enriched["llm_enriched"] = True
+    logger.info(
+        "url product enriched by llm: %s",
+        json.dumps({
+            "name": enriched.get("name"),
+            "brand": enriched.get("brand"),
+            "category": enriched.get("category"),
+            "price": enriched.get("price"),
+        }, ensure_ascii=False, indent=2, default=str),
+    )
+    return enriched
+
+
+## URL 본문 수집에 실패했을 때 URL 자체의 단서와 네이버 검색으로 상품 정보를 보강합니다.
+async def fallback_product_from_url(
+    url: str,
+    error: Optional[Exception] = None,
+) -> Dict[str, Any]:
+    query_hint = extract_url_query_hint(url)
+    naver_info = extract_naver_store_url_info(url)
+    inferred_brand = naver_info.get("brand") or infer_brand_from_text(query_hint, url)
+    product: Dict[str, Any] = {
+        "name": "URL 입력 상품",
+        "brand": inferred_brand,
+        "source_url": url,
+        "shop": detect_shop(url),
+        "description": "URL에서 상품 정보를 자동 추출하지 못해 URL 단서와 네이버 쇼핑 검색으로 보강합니다.",
+        "url_query": query_hint,
+        "name_from_url_hint": bool(query_hint),
+        "naver_store": naver_info,
+    }
+    if error:
+        product["url_fetch_error"] = str(error)
+        logger.info(
+            "url fetch failed, fallback extraction started: %s",
+            json.dumps({
+                "url": url,
+                "query_hint": query_hint,
+                "brand": product.get("brand"),
+                "naver_store": naver_info,
+                "error": str(error),
+            }, ensure_ascii=False, indent=2, default=str),
+        )
+    product = await enrich_product_with_naver_search(product)
+    if not product.get("brand"):
+        product["brand"] = infer_brand_from_text(product.get("name"), product.get("description"), query_hint, url)
+    if not product.get("category"):
+        product["category"] = detect_category(f"{product.get('name', '')} {product.get('description', '')}")
+    if is_generic_product_name(product.get("name")) and query_hint:
+        product["name"] = query_hint
+    product.setdefault("price", 0)
+    product.setdefault("rating", 3.5)
+    product.setdefault("review_count", 0)
+    product.setdefault("return_rate", 5.0)
+    return product
+
+
 ## URL 페이지를 가져와 메타태그, JSON-LD, 본문 텍스트에서 상품 정보를 추출합니다.
 async def extract_from_url(
     url: str,
@@ -153,33 +595,56 @@ async def extract_from_url(
             response = await client.get(url)
             response.raise_for_status()
             html = response.text
-    except Exception:
-        return {
-            "name": "URL 입력 상품",
-            "source_url": url,
-            "shop": detect_shop(url),
-            "description": "URL에서 상품 정보를 자동 추출하지 못했습니다. 기본값으로 분석합니다.",
-        }
+    except Exception as exc:
+        return await fallback_product_from_url(url, exc)
 
     soup = BeautifulSoup(html, "lxml")
     product = parse_json_ld(soup)
+    naver_info = extract_naver_store_url_info(url)
+    product["url_query"] = extract_url_query_hint(url)
+    product["naver_store"] = naver_info
+    script_product = parse_script_product_data(soup)
+    for key, value in script_product.items():
+        if not product.get(key):
+            product[key] = value
 
     if not product.get("name"):
-        og_title = soup.find("meta", property="og:title")
-        title = og_title.get("content") if og_title else None
+        title = get_meta_content(soup, "og:title", "twitter:title", "title", "name")
         if not title and soup.title:
             title = soup.title.get_text(" ", strip=True)
-        product["name"] = _clean_text(title) or "URL 입력 상품"
+        product["name"] = clean_product_title(title) or "URL 입력 상품"
 
     if not product.get("description"):
-        og_desc = soup.find("meta", property="og:description")
-        product["description"] = _clean_text(og_desc.get("content")) if og_desc else None
+        product["description"] = get_meta_content(soup, "og:description", "twitter:description", "description")
+
+    if not product.get("brand"):
+        product["brand"] = get_meta_content(
+            soup,
+            "product:brand",
+            "brand",
+            "og:brand",
+            "twitter:data1",
+        )
+    if not product.get("brand"):
+        product["brand"] = naver_info.get("brand")
 
     if not product.get("image_url"):
-        og_image = soup.find("meta", property="og:image")
-        product["image_url"] = og_image.get("content") if og_image else None
+        product["image_url"] = get_meta_content(soup, "og:image", "twitter:image", "image")
+
+    if not product.get("price"):
+        price_text = get_meta_content(
+            soup,
+            "product:price:amount",
+            "product:sale_price:amount",
+            "price",
+            "og:price:amount",
+        )
+        if price_text:
+            product["price"] = _number_from_text(price_text)
 
     visible_text = soup.get_text(" ", strip=True)[:8000]
+    if not product.get("brand"):
+        product["brand"] = infer_brand_from_text(product.get("name"), product.get("description"), product.get("url_query"), visible_text[:1000])
     if not product.get("price"):
         product["price"] = _number_from_text(visible_text) or 0
     if not product.get("rating"):
@@ -193,6 +658,12 @@ async def extract_from_url(
 
     product["source_url"] = url
     product["shop"] = detect_shop(url)
+    if is_generic_product_name(product.get("name")) and product.get("url_query"):
+        product["name_from_url_hint"] = True
+    product = await enrich_product_with_naver_search(product)
+    product = await enrich_product_with_llm(product, visible_text)
+    if not product.get("brand"):
+        product["brand"] = infer_brand_from_text(product.get("name"), product.get("description"), product.get("url_query"), url)
     return product
 
 
