@@ -57,6 +57,7 @@ export interface LLMAnalysis {
 }
 
 export interface AnalysisResult {
+  product?: ProductInfo;
   product_name?: string;
   regret_score?: number;
   regret_level?: RegretLevel;

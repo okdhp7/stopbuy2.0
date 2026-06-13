@@ -398,12 +398,42 @@ export default function Home() {
                           </div>
                         )}
 
-                        <h2
-                          className="font-bold text-lg leading-snug mb-4"
-                          style={{ color: "var(--sb-text-primary)", fontFamily: "'Space Grotesk', monospace" }}
-                        >
-                          {result.product_name || "분석 상품"}
-                        </h2>
+                        <div className="mb-4">
+                          <h2
+                            className="font-bold text-lg leading-snug"
+                            style={{ color: "var(--sb-text-primary)", fontFamily: "'Space Grotesk', monospace" }}
+                          >
+                            {result.product_name || result.product?.name || "분석 상품"}
+                          </h2>
+                          {(result.product?.brand || result.product?.category || result.product?.price != null) && (
+                            <div className="flex flex-wrap items-center gap-2 mt-2 text-xs" style={{ color: "var(--sb-text-muted)" }}>
+                              {result.product?.brand && (
+                                <span
+                                  className="px-2 py-1 rounded-lg"
+                                  style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
+                                >
+                                  브랜드: <strong style={{ color: "var(--sb-text-secondary)" }}>{result.product.brand}</strong>
+                                </span>
+                              )}
+                              {result.product?.category && (
+                                <span
+                                  className="px-2 py-1 rounded-lg"
+                                  style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
+                                >
+                                  카테고리: <strong style={{ color: "var(--sb-text-secondary)" }}>{result.product.category}</strong>
+                                </span>
+                              )}
+                              {result.product?.price != null && (
+                                <span
+                                  className="px-2 py-1 rounded-lg"
+                                  style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
+                                >
+                                  가격: <strong style={{ color: "var(--sb-blue-light)" }}>{result.product.price.toLocaleString("ko-KR")}원</strong>
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </div>
 
                         {/* 스코어 그리드 */}
                         <div className="grid grid-cols-2 gap-3">
