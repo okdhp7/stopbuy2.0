@@ -91,7 +91,16 @@ async def handle_request(ws: ServerConnection, session_id: str, data: Dict[str, 
             })
             return
 
-        await send_progress(ws, session_id, 25, "상품 정보를 추출하고 있습니다.")
+        if data.get("input_type") == "url":
+            product_url = str(data.get("product_url") or "").lower()
+            if "coupang.com" in product_url:
+                await send_progress(ws, session_id, 25, "쿠팡 상품 정보를 추출하고 있습니다. 접근이 제한되면 브라우저 방식으로 다시 확인합니다.")
+            elif "gmarket" in product_url:
+                await send_progress(ws, session_id, 25, "G마켓 상품 정보를 추출하고 있습니다. 접근이 제한되면 상품코드와 검색 결과로 보강합니다.")
+            else:
+                await send_progress(ws, session_id, 25, "상품 정보를 추출하고 있습니다.")
+        else:
+            await send_progress(ws, session_id, 25, "상품 정보를 추출하고 있습니다.")
         product = await extract_product_info(data)
         if data.get("input_type") == "manual" and isinstance(product, dict):
             has_rating = product.get("rating") not in (None, "")

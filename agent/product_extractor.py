@@ -25,6 +25,9 @@ NAVER_LOG_PAYLOAD_MAX_LENGTH = int(os.getenv("NAVER_LOG_PAYLOAD_MAX_LENGTH", "80
 NAVER_REVIEW_ENRICH_ENABLED = os.getenv("NAVER_REVIEW_ENRICH_ENABLED", "true").lower() not in {"0", "false", "no"}
 NAVER_REVIEW_ENRICH_LIMIT = int(os.getenv("NAVER_REVIEW_ENRICH_LIMIT", "5"))
 NAVER_REVIEW_SAMPLE_LIMIT = int(os.getenv("NAVER_REVIEW_SAMPLE_LIMIT", "3"))
+COUPANG_BROWSER_FALLBACK_ENABLED = os.getenv("COUPANG_BROWSER_FALLBACK_ENABLED", "true").lower() not in {"0", "false", "no", "n"}
+COUPANG_BROWSER_TIMEOUT_SECONDS = float(os.getenv("COUPANG_BROWSER_TIMEOUT_SECONDS", "20"))
+COUPANG_BROWSER_HEADLESS = os.getenv("COUPANG_BROWSER_HEADLESS", "true").lower() not in {"0", "false", "no", "n"}
 logger = logging.getLogger("stopbuy-agent.naver")
 
 
@@ -38,6 +41,40 @@ CATEGORY_KEYWORDS = {
 }
 
 GENERIC_URL_PRODUCT_NAMES = {"URL 입력 상품", "상품", "product", "unknown", "null"}
+GENERIC_PAGE_TITLES = {
+    "G마켓 - 쇼핑을 바꾸는 쇼핑",
+    "G마켓",
+    "Access Denied",
+}
+PRICE_KEY_PRIORITY = {
+    "finalprice": 0,
+    "final_price": 0,
+    "saleprice": 1,
+    "sale_price": 1,
+    "discountprice": 1,
+    "discount_price": 1,
+    "discountedsaleprice": 1,
+    "discounted_sale_price": 1,
+    "mobilediscountedsaleprice": 1,
+    "mobile_discounted_sale_price": 1,
+    "dispdiscountedsaleprice": 1,
+    "disp_discounted_sale_price": 1,
+    "couponprice": 1,
+    "coupon_price": 1,
+    "lprice": 1,
+    "lowprice": 1,
+    "low_price": 1,
+    "sellingprice": 2,
+    "selling_price": 2,
+    "price": 3,
+    "regularprice": 4,
+    "regular_price": 4,
+    "originprice": 4,
+    "originalprice": 4,
+    "listprice": 4,
+    "hprice": 5,
+    "highprice": 5,
+}
 BRAND_KEYWORDS = {
     "삼성": ["삼성", "삼성전자", "samsung", "galaxy", "갤럭시"],
     "애플": ["애플", "apple", "iphone", "아이폰", "ipad", "아이패드", "macbook", "맥북", "airpods", "에어팟"],
@@ -90,6 +127,32 @@ def _number_from_text(
         return float(match.group(1).replace(",", ""))
     except ValueError:
         return None
+
+
+## 가격 키 이름에 따라 할인가/최종가를 정가보다 우선하도록 우선순위를 계산합니다.
+def price_key_priority(
+    key: Any,
+) -> int:
+    normalized = re.sub(r"[^0-9a-zA-Z_]+", "", str(key or "")).lower()
+    return PRICE_KEY_PRIORITY.get(normalized, 9)
+
+
+## 가격 후보를 결과에 반영하되 할인가와 최종가를 더 높은 우선순위로 유지합니다.
+def apply_price_candidate(
+    result: Dict[str, Any],
+    key: Any,
+    value: Any,
+) -> None:
+    price = _number_from_text(str(value))
+    if not price:
+        return
+    priority = price_key_priority(key)
+    current_priority = int(result.get("_price_priority", 99))
+    current_price = _number_from_text(str(result.get("price"))) or 0
+    if result.get("price") is None or priority < current_priority or (priority == current_priority and current_price and price < current_price):
+        result["price"] = price
+        result["_price_priority"] = priority
+        result["price_source_key"] = str(key)
 
 
 ## HTML 속성값과 스크립트의 유니코드 이스케이프를 안전하게 풀어냅니다.
@@ -208,6 +271,47 @@ def extract_coupang_url_info(
     return result
 
 
+## G마켓 상품 URL에서 상품코드와 검색 힌트를 추출합니다.
+def extract_gmarket_url_info(
+    url: str,
+) -> Dict[str, Optional[str]]:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    query_values = parse_qs(parsed.query)
+    result: Dict[str, Optional[str]] = {"goods_code": None, "keyword": None}
+    if "gmarket" not in host:
+        return result
+
+    for key in ("goodscode", "goodsCode", "goods_code", "gdsc_cd"):
+        values = query_values.get(key)
+        if values:
+            result["goods_code"] = str(values[0]).strip()
+            break
+
+    for key in ("keyword", "searchKeyword", "search", "q"):
+        values = query_values.get(key)
+        if values:
+            result["keyword"] = clean_product_title(unquote(str(values[0])))
+            break
+    return result
+
+
+## G마켓 URL 또는 네이버 쇼핑 경유 URL에서 G마켓 상품번호를 추출합니다.
+def extract_gmarket_product_id_from_url(
+    url: Any,
+) -> Optional[str]:
+    parsed = urlparse(str(url or ""))
+    query_values = parse_qs(parsed.query)
+    for key in ("goodscode", "goodsCode", "goods_code", "gdsc_cd", "item-no", "itemNo"):
+        values = query_values.get(key)
+        if values:
+            value = str(values[0]).strip()
+            if value.isdigit():
+                return value
+    match = re.search(r"(?:goodscode|goodsCode|item-no|itemNo)[=/](\d+)", str(url or ""))
+    return match.group(1) if match else None
+
+
 ## URL의 검색 쿼리와 경로에서 상품 검색에 쓸 후보 문구를 추출합니다.
 def extract_url_query_hint(
     url: str,
@@ -236,6 +340,12 @@ def extract_url_query_hint(
             ]
             if value
         )
+
+    gmarket_info = extract_gmarket_url_info(url)
+    if gmarket_info.get("keyword"):
+        return gmarket_info["keyword"]
+    if gmarket_info.get("goods_code"):
+        return " ".join(["G마켓", str(gmarket_info["goods_code"])])
 
     path_parts = [unquote(part) for part in parsed.path.split("/") if part]
     meaningful_parts = [
@@ -343,9 +453,9 @@ def parse_json_ld(
                 if isinstance(offers, list) and offers:
                     offers = offers[0]
                 if isinstance(offers, dict):
-                    price = offers.get("price") or offers.get("lowPrice")
-                    if price:
-                        result["price"] = _number_from_text(str(price))
+                    for key, value in offers.items():
+                        if price_key_priority(key) < 9:
+                            apply_price_candidate(result, key, value)
                 rating = item.get("aggregateRating")
                 if isinstance(rating, dict):
                     if rating.get("ratingValue"):
@@ -353,7 +463,7 @@ def parse_json_ld(
                     if rating.get("reviewCount"):
                         result["review_count"] = int(float(rating["reviewCount"]))
                 if result:
-                    return result
+                    return {key: value for key, value in result.items() if not key.startswith("_") and key != "price_source_key"}
         except Exception:
             continue
     return {}
@@ -377,10 +487,8 @@ def collect_product_values(
                 cleaned = clean_shopping_text(str(item)) if isinstance(item, (str, int, float)) else None
                 if cleaned and len(cleaned) >= 2:
                     result["brand"] = cleaned
-            if result.get("price") is None and lowered in {"price", "saleprice", "discountprice", "lprice", "lowprice"} and isinstance(item, (str, int, float)):
-                price = _number_from_text(str(item))
-                if price:
-                    result["price"] = price
+            if lowered in PRICE_KEY_PRIORITY and isinstance(item, (str, int, float)):
+                apply_price_candidate(result, lowered, item)
             if result.get("image_url") is None and lowered in {"image", "imageurl", "representimageurl", "thumbnail", "thumbnailurl"}:
                 if isinstance(item, list) and item:
                     item = item[0]
@@ -415,9 +523,7 @@ def parse_script_product_data(
         except Exception:
             continue
         collect_product_values(parsed, result)
-        if result.get("name") and result.get("brand") and result.get("price"):
-            break
-    return {key: item for key, item in result.items() if item not in (None, "")}
+    return {key: item for key, item in result.items() if item not in (None, "") and not key.startswith("_") and key != "price_source_key"}
 
 
 ## HTML 스크립트 텍스트에서 지정된 키의 문자열 값을 찾습니다.
@@ -466,7 +572,12 @@ def parse_common_product_data(
     product = parse_json_ld(soup)
     script_product = parse_script_product_data(soup)
     for key, value in script_product.items():
-        if not product.get(key):
+        if key == "price":
+            current_price = _number_from_text(str(product.get("price"))) or 0
+            next_price = _number_from_text(str(value)) or 0
+            if next_price and (not current_price or next_price <= current_price):
+                product[key] = next_price
+        elif not product.get(key):
             product[key] = value
 
     script_text = "\n".join(script.get_text(" ", strip=True) for script in soup.find_all("script"))[:2_000_000]
@@ -485,11 +596,40 @@ def parse_common_product_data(
             get_meta_content(soup, "product:category", "category")
             or find_script_string_value(script_text, "categoryName", "category_name", "displayCategoryName", "category")
         )
-    if not product.get("price"):
-        price_text = get_meta_content(soup, "product:price:amount", "product:sale_price:amount", "price", "og:price:amount")
-        product["price"] = _number_from_text(price_text or "") if price_text else None
-    if not product.get("price"):
-        product["price"] = find_script_number_value(script_text, "salePrice", "finalPrice", "discountPrice", "price", "lprice", "lowPrice")
+    price_result: Dict[str, Any] = {"price": None}
+    for key in [
+        "product:sale_price:amount",
+        "sale_price",
+        "discount_price",
+        "final_price",
+        "product:price:amount",
+        "og:price:amount",
+        "price",
+    ]:
+        price_text = get_meta_content(soup, key)
+        if price_text:
+            apply_price_candidate(price_result, key, price_text)
+    meta_price = _number_from_text(str(price_result.get("price"))) or 0
+    current_price = _number_from_text(str(product.get("price"))) or 0
+    if meta_price and (not current_price or meta_price <= current_price):
+        product["price"] = meta_price
+        current_price = meta_price
+    script_price = find_script_number_value(
+        script_text,
+        "finalPrice",
+        "discountedSalePrice",
+        "mobileDiscountedSalePrice",
+        "dispDiscountedSalePrice",
+        "salePrice",
+        "discountPrice",
+        "couponPrice",
+        "sellingPrice",
+        "lprice",
+        "lowPrice",
+        "price",
+    )
+    if script_price and (not current_price or script_price <= current_price):
+        product["price"] = script_price
     if not product.get("image_url"):
         product["image_url"] = (
             get_meta_content(soup, "og:image", "twitter:image", "image")
@@ -524,6 +664,272 @@ def parse_coupang_product_data(
     if not product.get("category"):
         product["category"] = detect_category(f"{product.get('name', '')} {product.get('description', '')}")
     return product
+
+
+## G마켓 상품 페이지에서 상품명, 브랜드, 카테고리, 가격을 우선 추출합니다.
+def parse_gmarket_product_data(
+    soup: BeautifulSoup,
+    html: str,
+    url: str,
+) -> Dict[str, Any]:
+    product = parse_common_product_data(soup, html)
+    gmarket_info = extract_gmarket_url_info(url)
+    product["gmarket_product"] = gmarket_info
+    product["shop"] = "gmarket"
+    product["product_info_source"] = "gmarket_url"
+
+    if not product.get("name"):
+        title = get_meta_content(soup, "og:title", "twitter:title", "title", "name")
+        if not title and soup.title:
+            title = soup.title.get_text(" ", strip=True)
+        product["name"] = clean_product_title(title)
+    if product.get("name") in GENERIC_PAGE_TITLES:
+        product["name"] = None
+
+    if not product.get("name"):
+        for selector in [
+            "h1.itemtit",
+            ".itemtit",
+            ".box__item-title",
+            ".item-topinfo_headline",
+            "[class*='item-title']",
+            "h1",
+        ]:
+            tag = soup.select_one(selector)
+            if tag:
+                product["name"] = clean_product_title(tag.get_text(" ", strip=True))
+                if product["name"]:
+                    break
+
+    if not product.get("price"):
+        for selector in [
+            ".price_discount",
+            ".box__price-coupon strong",
+            ".box__price-coupon",
+            ".box__price-seller strong",
+            ".box__price-seller",
+            ".price_real",
+            ".price",
+            "[class*='discount'][class*='price']",
+            "[class*='sale'][class*='price']",
+            "[class*='price'] strong",
+            "[class*='price']",
+        ]:
+            tag = soup.select_one(selector)
+            if tag:
+                price = _number_from_text(tag.get_text(" ", strip=True))
+                if price:
+                    product["price"] = int(price)
+                    break
+
+    if not product.get("brand"):
+        product["brand"] = get_meta_content(soup, "product:brand", "brand", "og:brand")
+    if not product.get("brand"):
+        product["brand"] = infer_brand_from_text(product.get("name"), product.get("description"), url)
+    if not product.get("category"):
+        product["category"] = detect_category(f"{product.get('name', '')} {product.get('description', '')}")
+    return {key: item for key, item in product.items() if item not in (None, "")}
+
+
+## 상품정보가 구매후회예측에 쓰기 어려울 만큼 부족한지 판단합니다.
+def is_incomplete_product_info(
+    product: Dict[str, Any],
+) -> bool:
+    name = product.get("name")
+    price = _number_from_text(str(product.get("price"))) or 0
+    return is_generic_product_name(name) or name in GENERIC_PAGE_TITLES or not name or price <= 0
+
+
+## 기존 추출 결과에 브라우저 fallback 결과를 병합합니다.
+def merge_product_info(
+    base: Dict[str, Any],
+    addition: Dict[str, Any],
+) -> Dict[str, Any]:
+    merged = dict(base)
+    for key in ("name", "brand", "category", "price", "image_url", "description"):
+        value = addition.get(key)
+        if value in (None, ""):
+            continue
+        if key == "name":
+            if is_generic_product_name(merged.get("name")) or not merged.get("name"):
+                merged[key] = value
+            continue
+        if key == "price":
+            current_price = _number_from_text(str(merged.get("price"))) or 0
+            next_price = _number_from_text(str(value)) or 0
+            if next_price and current_price <= 0:
+                merged[key] = next_price
+            continue
+        if not merged.get(key):
+            merged[key] = value
+    for key, value in addition.items():
+        if key not in merged and value not in (None, ""):
+            merged[key] = value
+    return merged
+
+
+## Playwright 브라우저로 쿠팡 상품 페이지를 렌더링해 상품정보를 추출합니다.
+async def extract_coupang_with_browser(
+    url: str,
+) -> Dict[str, Any]:
+    if not COUPANG_BROWSER_FALLBACK_ENABLED:
+        return {}
+
+    timeout_ms = int(max(COUPANG_BROWSER_TIMEOUT_SECONDS, 3) * 1000)
+    logger.info("coupang browser fallback start: url=%s", url)
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as exc:
+        logger.info("coupang browser fallback unavailable: %s", exc)
+        return {
+            "browser_fallback_attempted": True,
+            "browser_fallback_success": False,
+            "browser_fallback_error": f"Playwright를 사용할 수 없습니다: {exc}",
+        }
+
+    browser = None
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                headless=COUPANG_BROWSER_HEADLESS,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            context = await browser.new_context(
+                locale="ko-KR",
+                timezone_id="Asia/Seoul",
+                viewport={"width": 1365, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0.0.0 Safari/537.36"
+                ),
+                extra_http_headers={
+                    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Referer": "https://www.coupang.com/",
+                },
+            )
+            page = await context.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 8000))
+            except Exception:
+                pass
+            await page.wait_for_timeout(1500)
+
+            data = await page.evaluate(
+                """
+                () => {
+                  const clean = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                  const text = (selectors) => {
+                    for (const selector of selectors) {
+                      const node = document.querySelector(selector);
+                      const value = node ? clean(node.innerText || node.textContent || "") : "";
+                      if (value) return value;
+                    }
+                    return "";
+                  };
+                  const attr = (selectors, name) => {
+                    for (const selector of selectors) {
+                      const node = document.querySelector(selector);
+                      const value = node ? clean(node.getAttribute(name) || "") : "";
+                      if (value) return value;
+                    }
+                    return "";
+                  };
+                  const meta = (names) => {
+                    for (const name of names) {
+                      const node = document.querySelector(`meta[property="${name}"], meta[name="${name}"], meta[itemprop="${name}"]`);
+                      const value = node ? clean(node.getAttribute("content") || "") : "";
+                      if (value) return value;
+                    }
+                    return "";
+                  };
+                  const title = clean(document.title || "");
+                  const bodyText = clean(document.body ? document.body.innerText || "" : "");
+                  return {
+                    title,
+                    body_text_sample: bodyText.slice(0, 1000),
+                    name: text([
+                      "h1.prod-buy-header__title",
+                      ".prod-buy-header__title",
+                      "h1[class*='title']",
+                      "h1"
+                    ]) || meta(["og:title", "twitter:title", "title"]),
+                    price: text([
+                      ".prod-coupon-price .total-price",
+                      ".prod-sale-price .total-price",
+                      ".prod-price .total-price",
+                      "[class*='total-price']",
+                      "[class*='sale-price']",
+                      "[class*='price'] strong",
+                      "[class*='price']"
+                    ]) || meta(["product:price:amount", "og:price:amount", "price"]),
+                    category: text([
+                      ".breadcrumb a:last-child",
+                      ".breadcrumb-link:last-child",
+                      "[class*='breadcrumb'] a:last-child",
+                      "[class*='breadcrumb'] li:last-child"
+                    ]) || meta(["product:category", "category"]),
+                    image_url: meta(["og:image", "twitter:image", "image"]) || attr(["img.prod-image__detail", "img[class*='prod-image']", "img"], "src"),
+                    description: meta(["og:description", "description"])
+                  };
+                }
+                """
+            )
+            await context.close()
+
+        title = clean_product_title(data.get("title"))
+        name = clean_product_title(data.get("name")) or title
+        if name and "Access Denied" in name:
+            name = None
+        body_sample = str(data.get("body_text_sample") or "")
+        blocked = any(keyword in f"{title or ''} {body_sample}" for keyword in ["Access Denied", "접근이 제한", "자동화"])
+        product = {
+            "name": name,
+            "brand": infer_brand_from_text(name, data.get("description")),
+            "category": clean_shopping_text(data.get("category")) or detect_category(f"{name or ''} {data.get('description') or ''}"),
+            "price": _number_from_text(str(data.get("price") or "")) or 0,
+            "image_url": data.get("image_url"),
+            "description": clean_shopping_text(data.get("description")),
+            "browser_fallback_attempted": True,
+            "browser_fallback_success": bool(name and not blocked),
+            "browser_fallback_blocked": blocked,
+            "product_info_source": "coupang_browser",
+        }
+        logger.info(
+            "coupang browser fallback result: %s",
+            json.dumps({
+                "success": product["browser_fallback_success"],
+                "blocked": product["browser_fallback_blocked"],
+                "name": product.get("name"),
+                "brand": product.get("brand"),
+                "category": product.get("category"),
+                "price": product.get("price"),
+            }, ensure_ascii=False, indent=2, default=str),
+        )
+        return product if product["browser_fallback_success"] else {
+            "browser_fallback_attempted": True,
+            "browser_fallback_success": False,
+            "browser_fallback_blocked": blocked,
+            "browser_fallback_error": "브라우저 방식에서도 쿠팡 상품정보를 확인하지 못했습니다.",
+        }
+    except Exception as exc:
+        logger.info("coupang browser fallback failed: %s", exc)
+        return {
+            "browser_fallback_attempted": True,
+            "browser_fallback_success": False,
+            "browser_fallback_error": str(exc),
+        }
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
 ## 네이버 쇼핑/브랜드스토어 페이지에서 상품명, 브랜드, 카테고리, 가격을 우선 추출합니다.
@@ -627,18 +1033,25 @@ def build_naver_search_queries(
     product: Dict[str, Any],
 ) -> List[str]:
     naver_store = product.get("naver_store") if isinstance(product.get("naver_store"), dict) else {}
+    gmarket_product = product.get("gmarket_product") if isinstance(product.get("gmarket_product"), dict) else {}
     candidates = [
         product.get("url_query"),
         " ".join(str(value) for value in [product.get("brand"), product.get("name")] if value and not is_generic_product_name(value)),
         None if is_generic_product_name(product.get("name")) else product.get("name"),
         product.get("brand"),
         naver_store.get("brand"),
+        gmarket_product.get("keyword"),
     ]
     product_id = naver_store.get("product_id")
     if product_id and any(candidates):
         candidates.append(" ".join(str(value) for value in [product.get("brand") or naver_store.get("brand"), product_id] if value))
     if product_id:
         candidates.append(product_id)
+    goods_code = gmarket_product.get("goods_code")
+    if goods_code and any(candidates):
+        candidates.append(" ".join(str(value) for value in [product.get("brand"), product.get("name"), goods_code] if value and not is_generic_product_name(value)))
+    if goods_code:
+        candidates.append(goods_code)
 
     queries: List[str] = []
     for candidate in candidates:
@@ -672,7 +1085,11 @@ async def enrich_product_with_naver_search(
         )
         return product
     naver_store = product.get("naver_store") if isinstance(product.get("naver_store"), dict) else {}
+    gmarket_product = product.get("gmarket_product") if isinstance(product.get("gmarket_product"), dict) else {}
     source_product_id = str(naver_store.get("product_id") or "")
+    source_gmarket_id = str(gmarket_product.get("goods_code") or "")
+    has_gmarket_keyword = bool(gmarket_product.get("keyword"))
+    has_real_product_name = bool(product.get("name") and not is_generic_product_name(product.get("name")) and product.get("name") not in GENERIC_PAGE_TITLES)
     candidates: List[Dict[str, Any]] = []
     used_query = queries[0]
     matched_candidate: Optional[Dict[str, Any]] = None
@@ -697,6 +1114,21 @@ async def enrich_product_with_naver_search(
                     if value
                 }
                 if source_product_id in candidate_product_ids:
+                    matched_candidate = candidate
+                    candidates = query_candidates
+                    used_query = query
+                    break
+        if source_gmarket_id and query_candidates:
+            for candidate in query_candidates:
+                candidate_gmarket_ids = {
+                    str(value)
+                    for value in [
+                        extract_gmarket_product_id_from_url(candidate.get("source_url")),
+                        extract_gmarket_product_id_from_url(candidate.get("product_url")),
+                    ]
+                    if value
+                }
+                if source_gmarket_id in candidate_gmarket_ids:
                     matched_candidate = candidate
                     candidates = query_candidates
                     used_query = query
@@ -740,6 +1172,18 @@ async def enrich_product_with_naver_search(
         reference_text,
         f"{best_candidate.get('name', '')} {best_candidate.get('brand', '')}",
     )
+    if source_gmarket_id and not matched_candidate and not has_gmarket_keyword and not has_real_product_name:
+        logger.info(
+            "url naver enrichment skipped: %s",
+            json.dumps({
+                "reason": "gmarket_code_only_without_exact_match",
+                "goods_code": source_gmarket_id,
+                "query": used_query,
+                "candidate_name": best_candidate.get("name"),
+                "candidate_source_url": best_candidate.get("source_url"),
+            }, ensure_ascii=False, indent=2, default=str),
+        )
+        return product
     if score < 0.05 and not is_generic_product_name(product.get("name")) and not product.get("name_from_url_hint"):
         return product
     enriched = merge_naver_candidate(product, best_candidate)
@@ -838,6 +1282,7 @@ async def fallback_product_from_url(
     query_hint = extract_url_query_hint(url)
     naver_info = extract_naver_store_url_info(url)
     coupang_info = extract_coupang_url_info(url)
+    gmarket_info = extract_gmarket_url_info(url)
     inferred_brand = naver_info.get("brand") or infer_brand_from_text(query_hint, url)
     product: Dict[str, Any] = {
         "name": "URL 입력 상품",
@@ -849,10 +1294,13 @@ async def fallback_product_from_url(
         "name_from_url_hint": bool(query_hint),
         "naver_store": naver_info,
         "coupang_product": coupang_info,
+        "gmarket_product": gmarket_info,
         "product_info_source": f"{shop}_url_fallback",
     }
     if shop == "coupang":
         product["description"] = "쿠팡 URL에서 상품 본문을 자동 추출하지 못했습니다. 쿠팡 페이지 접근 제한 또는 동적 렌더링일 수 있습니다."
+    if shop == "gmarket":
+        product["description"] = "G마켓 URL에서 상품 본문을 자동 추출하지 못했습니다. G마켓 상품코드와 URL 단서를 이용해 네이버 쇼핑 검색으로 보강합니다."
     if error:
         product["url_fetch_error"] = str(error)
         logger.info(
@@ -864,10 +1312,14 @@ async def fallback_product_from_url(
                 "brand": product.get("brand"),
                 "naver_store": naver_info,
                 "coupang_product": coupang_info,
+                "gmarket_product": gmarket_info,
                 "error": str(error),
             }, ensure_ascii=False, indent=2, default=str),
         )
-    if shop == "naver":
+    if shop == "coupang":
+        browser_product = await extract_coupang_with_browser(url)
+        product = merge_product_info(product, browser_product)
+    if shop in {"naver", "gmarket"}:
         product = await enrich_product_with_naver_search(product)
     if not product.get("brand"):
         product["brand"] = infer_brand_from_text(product.get("name"), product.get("description"), query_hint, url)
@@ -911,6 +1363,11 @@ async def finalize_url_product(
         product["name_from_url_hint"] = True
     if shop == "naver":
         product = await enrich_product_with_naver_search(product)
+    if shop == "coupang" and is_incomplete_product_info(product):
+        browser_product = await extract_coupang_with_browser(url)
+        product = merge_product_info(product, browser_product)
+    if shop == "gmarket" and is_incomplete_product_info(product):
+        product = await enrich_product_with_naver_search(product)
     if shop != "coupang":
         product = await enrich_product_with_llm(product, visible_text)
     if not product.get("brand"):
@@ -943,12 +1400,16 @@ async def extract_from_url(
         product = parse_coupang_product_data(soup, html, url)
     elif shop == "naver":
         product = parse_naver_product_data(soup, html, url)
+    elif shop == "gmarket":
+        product = parse_gmarket_product_data(soup, html, url)
     else:
         product = parse_common_product_data(soup, html)
 
     naver_info = extract_naver_store_url_info(url)
+    gmarket_info = extract_gmarket_url_info(url)
     product["url_query"] = extract_url_query_hint(url)
     product["naver_store"] = naver_info
+    product["gmarket_product"] = gmarket_info
 
     if not product.get("name"):
         title = get_meta_content(soup, "og:title", "twitter:title", "title", "name")
@@ -1083,11 +1544,11 @@ def normalize_naver_shopping_item(
     index: int,
     query: str,
 ) -> Dict[str, Any]:
-    raw_price = item.get("lprice") or item.get("hprice") or 0
-    try:
-        price = int(float(raw_price))
-    except (TypeError, ValueError):
-        price = 0
+    price_result: Dict[str, Any] = {"price": None}
+    for key in ("lprice", "salePrice", "discountPrice", "lowPrice", "price", "hprice"):
+        if item.get(key) not in (None, ""):
+            apply_price_candidate(price_result, key, item.get(key))
+    price = int(price_result.get("price") or 0)
 
     category = next(
         (
