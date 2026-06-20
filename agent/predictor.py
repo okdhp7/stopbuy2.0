@@ -136,7 +136,7 @@ LOCAL_LLM_MAX_NEW_TOKENS = int(os.getenv("LOCAL_LLM_MAX_NEW_TOKENS", "256"))
 PREFERENCE_LLM_WARMUP_ENABLED = os.getenv("PREFERENCE_LLM_WARMUP_ENABLED", "true").lower() not in {"0", "false", "no", "n"}
 DEFAULT_AGENT_OPTIONS = {
     "alternative_regret_score_threshold": 30,
-    "max_alternative_products": 5,
+    "max_alternative_products": 12,
 }
 
 LLM_MODEL_ALIASES = {
@@ -1842,6 +1842,7 @@ class RegretPredictor:
         self,
         user: Dict[str, Any],
         product: Dict[str, Any],
+        alternative_candidates: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         raw_price = safe_float(product.get("price"))
         price_estimated = raw_price <= 0
@@ -1872,7 +1873,12 @@ class RegretPredictor:
         regret_score = score_result["regret_score"]
         alternatives = []
         if regret_score >= self.threshold:
-            alternatives = self.recommend_alternatives(user, normalized_product, regret_score)
+            alternatives = self.recommend_alternatives(
+                user,
+                normalized_product,
+                regret_score,
+                alternative_candidates=alternative_candidates,
+            )
 
         return {
             "product": normalized_product,
@@ -1910,21 +1916,38 @@ class RegretPredictor:
         user: Dict[str, Any],
         product: Dict[str, Any],
         target_score: float,
+        alternative_candidates: Optional[List[Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         target_category = normalize_category(product.get("category"))
         target_price = safe_float(product.get("price"))
         budget = safe_float(user.get("budget"))
-        candidates = self.catalog.products
+        use_external_candidates = alternative_candidates is not None
+        external_candidates = [
+            self._normalize_alternative_candidate(candidate)
+            for candidate in (alternative_candidates or [])
+            if isinstance(candidate, dict)
+        ]
+        external_candidates = [candidate for candidate in external_candidates if candidate.get("name")]
+        catalog_candidates = self.catalog.products
+        candidates = external_candidates if use_external_candidates else catalog_candidates
         if target_category:
             same_category = [item for item in candidates if normalize_category(item.get("category")) == target_category]
             if len(same_category) >= self.max_alternative_products:
                 candidates = same_category
 
         results = []
+        seen_keys = set()
         for candidate in candidates:
+            dedupe_key = str(candidate.get("source_url") or candidate.get("product_url") or candidate.get("product_id") or candidate.get("name") or "").lower()
+            if dedupe_key and dedupe_key in seen_keys:
+                continue
+            if dedupe_key:
+                seen_keys.add(dedupe_key)
             if candidate.get("name") == product.get("name"):
                 continue
-            score = self._predict_score(user, candidate, use_llm_preference=False)["regret_score"]
+            base_score = self._predict_score(user, candidate, use_llm_preference=False)["regret_score"]
+            condition_adjustment = self._alternative_condition_adjustment(user, candidate, product)
+            score = clamp_score(base_score + condition_adjustment["adjustment"])
             if score > target_score:
                 continue
             match_score = self._match_score(user, candidate, target_price)
@@ -1932,7 +1955,9 @@ class RegretPredictor:
             price_score = self._price_advantage(candidate, target_price, budget)
             alignment = preference_alignment(user, candidate)
             preference_score = safe_float(alignment.get("alignment_score"), 0.5)
-            final_score = match_score * 0.45 + improvement * 0.30 + price_score * 0.10 + preference_score * 0.15
+            source_bonus = 0.12 if candidate.get("alternative_source") == "naver_shopping" else 0.0
+            relevance_bonus = min(safe_float(candidate.get("alternative_relevance_score")) * 0.25, 0.10)
+            final_score = match_score * 0.40 + improvement * 0.25 + price_score * 0.10 + preference_score * 0.13 + source_bonus + relevance_bonus
             results.append({
                 "product_id": candidate.get("product_id"),
                 "name": candidate.get("name"),
@@ -1940,17 +1965,60 @@ class RegretPredictor:
                 "category": candidate.get("category"),
                 "price": candidate.get("price"),
                 "rating": candidate.get("rating"),
+                "review_count": candidate.get("review_count"),
                 "return_rate": candidate.get("return_rate"),
                 "image_url": candidate.get("image_url") or PRODUCT_IMAGE_URLS.get(str(candidate.get("name", "")).lower()),
+                "source_url": candidate.get("source_url"),
+                "product_url": candidate.get("product_url"),
+                "mall_name": candidate.get("mall_name"),
+                "alternative_source": candidate.get("alternative_source") or "sample_catalog",
+                "alternative_search_query": candidate.get("alternative_search_query"),
+                "alternative_relevance_score": candidate.get("alternative_relevance_score"),
                 "regret_score": round(score, 4),
+                "base_regret_score": round(base_score, 4),
+                "alternative_condition_adjustment": condition_adjustment,
                 "match_score": round(match_score, 4),
                 "improvement_score": round(improvement, 4),
                 "final_score": round(final_score, 4),
                 "preference_alignment": alignment,
-                "recommendation_reason": self._recommendation_reason(user, candidate, product, score, target_score),
+                "recommendation_reason": self._recommendation_reason(user, candidate, product, score, target_score, condition_adjustment),
             })
-        results.sort(key=lambda item: (-item["final_score"], item["regret_score"], item["price"]))
+        results.sort(key=lambda item: (item["regret_score"], -item["final_score"], item["price"]))
         return results[:self.max_alternative_products]
+
+    ## 네이버 쇼핑 후보를 구매후회예측과 화면 출력에 맞는 대체상품 구조로 정규화합니다.
+    def _normalize_alternative_candidate(
+        self,
+        candidate: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        price = safe_float(candidate.get("price"))
+        rating_missing = candidate.get("rating") in (None, "")
+        review_count_missing = candidate.get("review_count") in (None, "")
+        return {
+            "product_id": candidate.get("product_id"),
+            "name": candidate.get("name"),
+            "brand": candidate.get("brand"),
+            "category": candidate.get("category"),
+            "price": price,
+            "rating": safe_float(candidate.get("rating"), 3.5),
+            "rating_missing": rating_missing,
+            "review_count": safe_int(candidate.get("review_count")),
+            "review_count_missing": review_count_missing,
+            "review_data_available": bool(candidate.get("review_data_available")),
+            "review_texts": candidate.get("review_texts") or [],
+            "review_source": candidate.get("review_source"),
+            "return_rate": safe_float(candidate.get("return_rate"), 5.0),
+            "days_since_release": safe_int(candidate.get("days_since_release"), 180),
+            "description": candidate.get("description"),
+            "image_url": candidate.get("image_url"),
+            "source_url": candidate.get("source_url"),
+            "product_url": candidate.get("product_url"),
+            "mall_name": candidate.get("mall_name"),
+            "alternative_source": candidate.get("alternative_source"),
+            "alternative_search_query": candidate.get("alternative_search_query"),
+            "alternative_relevance_score": candidate.get("alternative_relevance_score"),
+            "price_estimated": price <= 0,
+        }
 
     ## 예산, 선호 브랜드, 평점, 반품률, 가격 이점을 종합한 추천 적합도를 계산합니다.
     def _match_score(
@@ -1995,6 +2063,97 @@ class RegretPredictor:
             score += min((target_price - price) / target_price, 0.5)
         return min(score, 1.0)
 
+    ## 대체상품 후보가 사용자의 예산, 선호브랜드, 중요요소, 사용목적에 맞는지 별도 보정값으로 계산합니다.
+    def _alternative_condition_adjustment(
+        self,
+        user: Dict[str, Any],
+        candidate: Dict[str, Any],
+        target: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        price = safe_float(candidate.get("price"))
+        budget = safe_float(user.get("budget"))
+        target_price = safe_float(target.get("price"))
+        preferred_tokens = tokenize_preference_text(user.get("preferred_brands"))
+        brand_tokens = tokenize_preference_text(candidate.get("brand"), candidate.get("name"))
+        factor_tokens = tokenize_preference_text(user.get("important_factors"))
+        purpose_tokens = tokenize_preference_text(user.get("usage_purpose"))
+        budget_tokens = {"price", "budget", "cheap", "value", "가격", "예산", "가성비", "저렴"}
+
+        adjustment = 0.0
+        reasons: List[str] = []
+
+        if budget > 0 and price > 0:
+            if price > budget:
+                over_ratio = (price - budget) / max(budget, 1.0)
+                penalty = min(0.08 + math.log1p(over_ratio) * 0.11, 0.34)
+                if factor_tokens & budget_tokens:
+                    penalty += min(0.04 + over_ratio * 0.04, 0.12)
+                adjustment += penalty
+                reasons.append("예산 초과")
+            else:
+                under_ratio = (budget - price) / max(budget, 1.0)
+                bonus = min(0.05 + under_ratio * 0.10, 0.16)
+                if factor_tokens & budget_tokens:
+                    bonus += min(0.03 + under_ratio * 0.05, 0.08)
+                adjustment -= bonus
+                reasons.append("예산 적합")
+
+        if target_price > 0 and price > 0:
+            if price < target_price:
+                cheaper_ratio = (target_price - price) / max(target_price, 1.0)
+                adjustment -= min(cheaper_ratio * 0.08, 0.08)
+                reasons.append("대상상품보다 저렴")
+            elif price > target_price:
+                expensive_ratio = (price - target_price) / max(target_price, 1.0)
+                adjustment += min(expensive_ratio * 0.06, 0.10)
+                reasons.append("대상상품보다 비쌈")
+
+        brand_fit = resolve_brand_fit_score(preferred_tokens, brand_tokens, candidate.get("llm_preference_scores"))
+        if preferred_tokens:
+            if brand_fit >= 0.8:
+                adjustment -= 0.10
+                reasons.append("선호브랜드 일치")
+            elif brand_fit >= 0.45:
+                adjustment -= 0.03
+                reasons.append("선호브랜드 부분 일치")
+            else:
+                adjustment += 0.07
+                reasons.append("선호브랜드 불일치")
+
+        important_fit = preference_similarity_score(user.get("important_factors"), candidate)
+        if factor_tokens:
+            if important_fit >= 0.35:
+                adjustment -= min(0.04 + important_fit * 0.10, 0.13)
+                reasons.append("중요요소 적합")
+            elif important_fit < 0.12:
+                adjustment += 0.06
+                reasons.append("중요요소 부족")
+
+        purpose_fit = preference_similarity_score(user.get("usage_purpose"), candidate)
+        if purpose_tokens:
+            if purpose_fit >= 0.30:
+                adjustment -= min(0.03 + purpose_fit * 0.09, 0.11)
+                reasons.append("사용목적 적합")
+            elif purpose_fit < 0.12:
+                adjustment += 0.05
+                reasons.append("사용목적 부족")
+
+        relevance_score = clamp_unit(candidate.get("alternative_relevance_score"))
+        if relevance_score >= 0.6:
+            adjustment -= min(relevance_score * 0.04, 0.04)
+            reasons.append("검색 관련도 높음")
+
+        adjustment = max(-0.35, min(0.42, adjustment))
+        return {
+            "adjustment": round(adjustment, 4),
+            "budget": budget,
+            "price": price,
+            "brand_fit": round(brand_fit, 4),
+            "important_factor_fit": round(important_fit, 4),
+            "usage_purpose_fit": round(purpose_fit, 4),
+            "reasons": reasons,
+        }
+
     ## 대체상품 추천 사유를 사용자에게 보여줄 문장으로 조합합니다.
     def _recommendation_reason(
         self,
@@ -2003,6 +2162,7 @@ class RegretPredictor:
         target: Dict[str, Any],
         score: float,
         target_score: float,
+        condition_adjustment: Optional[Dict[str, Any]] = None,
     ) -> str:
         reasons = []
         if safe_float(user.get("budget")) and safe_float(candidate.get("price")) <= safe_float(user.get("budget")):
@@ -2017,6 +2177,9 @@ class RegretPredictor:
             reasons.append("예측 후회 점수가 더 낮습니다")
         if candidate.get("brand") in (user.get("preferred_brands") or []):
             reasons.append("선호 브랜드와 일치합니다")
+        for reason in (condition_adjustment or {}).get("reasons") or []:
+            if reason in {"중요요소 적합", "사용목적 적합", "선호브랜드 일치"}:
+                reasons.append(reason)
         return ", ".join(reasons) if reasons else "현재 상품보다 종합 위험도가 낮은 대체 후보입니다"
 
     ## Build the analysis object consumed by the frontend AI analysis tab.

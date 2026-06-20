@@ -1,8 +1,8 @@
 /*
  * StopBuy - 대체상품 카드 컴포넌트
- * Design: "Analytical Dual Theme" — CSS 변수(--sb-*) 기반 색상 처리
+ * Design: "Analytical Dual Theme" CSS 변수(--sb-*) 기반 색상 처리
  */
-import { Star, TrendingDown, ShieldCheck, Tag } from "lucide-react";
+import { ExternalLink, Star, TrendingDown, ShieldCheck, Tag } from "lucide-react";
 import type { AlternativeProduct } from "@/hooks/useStopBuyWS";
 import { getAlternativeProductImage, PRODUCT_PLACEHOLDER_IMAGE } from "@/lib/productImages";
 
@@ -16,12 +16,23 @@ interface AlternativeCardProps {
 export function AlternativeCard({ product, rank, targetRegretScore, style }: AlternativeCardProps) {
   const regretScore = product.regret_score ?? 0;
   const productImageUrl = getAlternativeProductImage(product);
+  const productUrl = product.product_url || product.source_url;
+  const sourceLabel = product.alternative_source === "naver_shopping"
+    ? product.mall_name || "네이버 쇼핑"
+    : product.mall_name || "추천 카탈로그";
   const improvement = targetRegretScore != null
     ? Math.round((targetRegretScore - regretScore) * 100)
     : null;
 
   const rankColors = ["#F59E0B", "#94A3B8", "#CD7F32"];
   const rankColor = rankColors[rank - 1] || "#64748B";
+
+  const openProductDetail = (event: React.MouseEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!productUrl) return;
+    window.open(productUrl, "_blank", "noopener,noreferrer");
+  };
 
   return (
     <div
@@ -31,7 +42,6 @@ export function AlternativeCard({ product, rank, targetRegretScore, style }: Alt
         ...style,
       }}
     >
-      {/* 상단: 순위 + 이미지 */}
       <div className="relative">
         <div
           className="absolute top-2 left-2 z-10 w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold"
@@ -59,8 +69,12 @@ export function AlternativeCard({ product, rank, targetRegretScore, style }: Alt
           </div>
         )}
 
-        <div
-          className="w-full h-36 overflow-hidden"
+        <button
+          type="button"
+          onClick={openProductDetail}
+          disabled={!productUrl}
+          aria-label={productUrl ? `${product.name || "상품"} 상세보기` : undefined}
+          className="w-full h-36 overflow-hidden block p-0 border-0 cursor-pointer disabled:cursor-default"
           style={{ background: "var(--sb-input-bg)" }}
         >
           <img
@@ -71,16 +85,27 @@ export function AlternativeCard({ product, rank, targetRegretScore, style }: Alt
               (e.target as HTMLImageElement).src = PRODUCT_PLACEHOLDER_IMAGE;
             }}
           />
-        </div>
+        </button>
       </div>
 
-      {/* 상품 정보 */}
       <div className="p-3 flex flex-col gap-2">
-        {product.brand && (
-          <span className="text-xs font-medium" style={{ color: "var(--sb-blue-light)" }}>
-            {product.brand}
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs font-medium truncate" style={{ color: "var(--sb-blue-light)" }}>
+            {product.brand || sourceLabel}
           </span>
-        )}
+          {product.alternative_source === "naver_shopping" && (
+            <span
+              className="text-[11px] px-1.5 py-0.5 rounded-full shrink-0"
+              style={{
+                background: "color-mix(in oklch, var(--sb-green) 10%, transparent)",
+                color: "var(--sb-green)",
+                border: "1px solid color-mix(in oklch, var(--sb-green) 25%, transparent)",
+              }}
+            >
+              네이버
+            </span>
+          )}
+        </div>
 
         <h3
           className="text-sm font-semibold leading-snug line-clamp-2"
@@ -88,6 +113,23 @@ export function AlternativeCard({ product, rank, targetRegretScore, style }: Alt
         >
           {product.name || "상품명 없음"}
         </h3>
+
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs truncate" style={{ color: "var(--sb-text-dim)" }}>
+            {sourceLabel}
+          </span>
+          {productUrl && (
+            <button
+              type="button"
+              onClick={openProductDetail}
+              className="inline-flex items-center gap-1 text-xs shrink-0 transition-colors"
+              style={{ color: "var(--sb-blue-light)" }}
+            >
+              상품보기
+              <ExternalLink size={11} />
+            </button>
+          )}
+        </div>
 
         {product.price != null && (
           <div className="flex items-center gap-1.5">

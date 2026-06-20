@@ -11,7 +11,7 @@ from env_loader import load_dotenv
 
 load_dotenv()
 
-from product_extractor import extract_product_candidates_from_image, extract_product_info
+from product_extractor import extract_alternative_candidates, extract_product_candidates_from_image, extract_product_info
 from predictor import RegretPredictor, resolve_llm_model_config, warm_up_preference_llm
 
 
@@ -118,10 +118,22 @@ async def handle_request(ws: ServerConnection, session_id: str, data: Dict[str, 
             )
         else:
             await send_progress(ws, session_id, 55, "구매 후회 가능성을 예측하고 있습니다.")
+        await send_progress(ws, session_id, 70, "네이버 쇼핑에서 조건에 맞는 대체상품을 검색하고 있습니다.")
+        alternative_result = await extract_alternative_candidates(
+            data.get("user") or {},
+            product,
+            max(predictor.max_alternative_products * 3, predictor.max_alternative_products),
+        )
+        product["alternative_candidate_queries"] = alternative_result.get("queries") or []
+        product["alternative_candidate_errors"] = alternative_result.get("errors") or []
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: predictor.predict(user=data.get("user") or {}, product=product),
+            lambda: predictor.predict(
+                user=data.get("user") or {},
+                product=product,
+                alternative_candidates=alternative_result.get("candidates") or [],
+            ),
         )
 
         await send_progress(ws, session_id, 85, "대체상품 추천 결과를 정리하고 있습니다.")

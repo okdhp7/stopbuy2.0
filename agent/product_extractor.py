@@ -1538,6 +1538,119 @@ def build_image_search_query(
     return ""
 
 
+## 분석 대상 상품과 구매조건을 이용해 대체상품 검색어 후보를 만듭니다.
+def build_alternative_search_queries(
+    user: Dict[str, Any],
+    product: Dict[str, Any],
+) -> List[str]:
+    category = clean_shopping_text(str(product.get("category") or ""))
+    brand = clean_shopping_text(str(product.get("brand") or ""))
+    name = clean_shopping_text(str(product.get("name") or ""))
+    purpose = clean_shopping_text(str(user.get("usage_purpose") or ""))
+    factors = clean_shopping_text(str(user.get("important_factors") or ""))
+    preferred_brands = user.get("preferred_brands")
+    if isinstance(preferred_brands, list):
+        preferred_brand_text = " ".join(str(item) for item in preferred_brands if item)
+    else:
+        preferred_brand_text = clean_shopping_text(str(preferred_brands or "")) or ""
+
+    modifier_tokens: List[str] = []
+    condition_text = f"{purpose} {factors}".lower()
+    if any(token in condition_text for token in ["가성비", "저렴", "예산", "가격", "cheap", "value"]):
+        modifier_tokens.extend(["가성비", "저렴한"])
+    if any(token in condition_text for token in ["선물", "gift"]):
+        modifier_tokens.append("선물")
+    if any(token in condition_text for token in ["프리미엄", "고급", "premium"]):
+        modifier_tokens.append("프리미엄")
+    if any(token in condition_text for token in ["대용량", "용량", "많은", "bulk"]):
+        modifier_tokens.append("대용량")
+
+    broad_categories = {"전자기기", "기타", "상품", "생활용품"}
+    base_terms = [term for term in [category, name, brand] if term and not is_generic_product_name(term)]
+    queries: List[str] = []
+    if name:
+        name_tokens = [token for token in re.split(r"\s+", name) if token and token.lower() not in {"url", "상품", "입력"}]
+        if name_tokens:
+            queries.append(" ".join(name_tokens[:6]))
+            if brand:
+                queries.append(" ".join([brand, *name_tokens[:5]]))
+    if category and category not in broad_categories:
+        queries.append(" ".join([category, *modifier_tokens[:2]]).strip())
+    if preferred_brand_text and category and category not in broad_categories:
+        queries.append(" ".join([preferred_brand_text, category, *modifier_tokens[:1]]).strip())
+    if base_terms:
+        queries.append(" ".join(base_terms[:2]))
+
+    normalized_queries: List[str] = []
+    for query in queries:
+        cleaned = _clean_text(query)
+        if cleaned and cleaned not in normalized_queries:
+            normalized_queries.append(cleaned)
+    return normalized_queries[:4]
+
+
+## 네이버 쇼핑에서 구매조건에 맞는 대체상품 후보를 검색합니다.
+async def extract_alternative_candidates(
+    user: Dict[str, Any],
+    product: Dict[str, Any],
+    limit: int,
+) -> Dict[str, Any]:
+    queries = build_alternative_search_queries(user, product)
+    candidates: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    seen: Set[str] = set()
+    target_name = str(product.get("name") or "").strip().lower()
+    target_url = str(product.get("source_url") or product.get("product_url") or "").strip()
+    reference_text = " ".join(
+        str(value)
+        for value in [product.get("name"), product.get("brand"), product.get("category"), user.get("usage_purpose"), user.get("important_factors")]
+        if value
+    )
+
+    for query in queries:
+        try:
+            products = await search_naver_shopping(query, max(limit * 2, NAVER_SHOPPING_DISPLAY))
+        except Exception as exc:
+            errors.append(f"{query}: {exc}")
+            continue
+
+        for item in products:
+            item_url = str(item.get("source_url") or item.get("product_url") or "")
+            item_name = str(item.get("name") or "").strip()
+            dedupe_key = item_url or item_name.lower()
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            if target_url and item_url and item_url == target_url:
+                continue
+            if target_name and item_name.lower() == target_name:
+                continue
+            price_value = _number_from_text(str(item.get("price") or ""))
+            if not item_name or not price_value:
+                continue
+            similarity = token_similarity(
+                reference_text,
+                f"{item.get('name', '')} {item.get('brand', '')} {item.get('category', '')} {item.get('description', '')}",
+            )
+            if reference_text and similarity < 0.03:
+                continue
+            seen.add(dedupe_key)
+            item["alternative_source"] = "naver_shopping"
+            item["alternative_search_query"] = query
+            item["alternative_relevance_score"] = round(similarity, 4)
+            candidates.append(item)
+
+    return {
+        "queries": queries,
+        "candidates": sorted(
+            candidates,
+            key=lambda item: _number_from_text(str(item.get("alternative_relevance_score") or "0")) or 0.0,
+            reverse=True,
+        )[:limit],
+        "errors": errors,
+        "naver_configured": bool(NAVER_CLIENT_ID and NAVER_CLIENT_SECRET),
+    }
+
+
 ## 네이버 쇼핑 API 응답 항목을 StopBuy 예측 입력과 화면 표시가 가능한 상품 후보 구조로 변환합니다.
 def normalize_naver_shopping_item(
     item: Dict[str, Any],

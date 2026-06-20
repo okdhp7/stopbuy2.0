@@ -261,7 +261,7 @@ function DetailModal({ sessionId, onClose }: { sessionId: string; onClose: () =>
                     추천 대체상품 ({detail.alternatives.length}개)
                   </h4>
                   <div className="space-y-2">
-                    {detail.alternatives.slice(0, 5).map((alt, i) => (
+                    {detail.alternatives.slice(0, 12).map((alt, i) => (
                       <div
                         key={i}
                         className="rounded-lg p-3 flex items-start justify-between gap-3"

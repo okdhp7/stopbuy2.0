@@ -45,6 +45,12 @@ export interface AlternativeProduct {
   final_score?: number;
   recommendation_reason?: string;
   image_url?: string;
+  source_url?: string;
+  product_url?: string;
+  mall_name?: string;
+  alternative_source?: string;
+  alternative_search_query?: string;
+  alternative_relevance_score?: number;
   preference_alignment?: PreferenceAlignment;
 }
 
@@ -376,7 +382,7 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
       setExtractedProduct(payload.extracted_product || null);
       setResult(null);
       setProgress(100);
-      setProgressMessage("??? ??? ??????.");
+      setProgressMessage("상품 후보를 선택하세요.");
       setStatus("selecting_product");
     } else if (type === "result") {
       setProductCandidates([]);
@@ -535,7 +541,7 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
       clearDemoTimers();
       clearCompletionTimer();
       setProgress(5);
-      setProgressMessage("??? ?? ?...");
+      setProgressMessage("연결 중...");
       setResult(null);
       setError(null);
       setProductCandidates([]);
@@ -562,7 +568,7 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
           activeSocket.send(JSON.stringify(requestMessage));
           setStatus("analyzing");
           setProgress(10);
-          setProgressMessage("\ubd84\uc11d \uc694\uccad \uc804\uc1a1 \uc644\ub8cc...");
+          setProgressMessage("분석 요청 전송 완료...");
           return;
         } catch (err) {
           console.error("WebSocket send failed, reconnecting:", err);
@@ -607,7 +613,7 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
       setError(null);
       setStatus("connecting");
       setProgress(5);
-      setProgressMessage("\uc120\ud0dd\ud55c \uc0c1\ud488\uc73c\ub85c \ubd84\uc11d\uc744 \uc900\ube44\ud558\uace0 \uc788\uc2b5\ub2c8\ub2e4.");
+      setProgressMessage("선택한 상품으로 분석을 준비하고 있습니다.");
 
       analyze({
         inputType: "manual",
