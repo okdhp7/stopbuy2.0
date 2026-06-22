@@ -82,6 +82,12 @@ export interface AnalysisResult {
 }
 
 export interface UserProfile {
+  gender?: string;
+  age?: number;
+  monthly_income?: number;
+  job?: string;
+  marital_status?: string;
+  consumption_type?: string;
   budget?: number;
   preferred_brands?: string[];
   important_factors?: string[];
@@ -135,7 +141,7 @@ interface UseStopBuyWSReturn {
     user?: UserProfile;
     product?: ProductInfo;
   }) => void;
-  selectProductCandidate: (candidate: ProductCandidate) => void;
+  selectProductCandidate: (candidate: ProductCandidate, userOverride?: UserProfile) => void;
   reset: () => void;
 }
 
@@ -585,7 +591,7 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
 
 
   const selectProductCandidate = useCallback(
-    (candidate: ProductCandidate) => {
+    (candidate: ProductCandidate, userOverride?: UserProfile) => {
       const selectedProduct: ProductInfo = {
         name: candidate.name,
         brand: candidate.brand,
@@ -614,10 +620,13 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
       setStatus("connecting");
       setProgress(5);
       setProgressMessage("선택한 상품으로 분석을 준비하고 있습니다.");
+      const selectedUser = userOverride
+        ? { ...(lastUserRef.current || {}), ...userOverride }
+        : lastUserRef.current;
 
       analyze({
         inputType: "manual",
-        user: lastUserRef.current,
+        user: selectedUser,
         product: selectedProduct,
       });
     },

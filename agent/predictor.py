@@ -47,6 +47,13 @@ RAW_NUMERIC_COLUMNS = [
 ENGINEERED_NUMERIC_COLUMNS = [
     "예산초과율",
     "예산사용율",
+    "월수입대비가격부담율",
+    "월수입대비예산부담율",
+    "소비성향위험도",
+    "연령대위험도",
+    "직업소득안정성",
+    "가구부담보정값",
+    "충동구매위험도",
     "사용목적적합도",
     "중요요소일치도",
     "브랜드선호일치도",
@@ -469,8 +476,7 @@ def preference_similarity_score(
     product_tokens = tokenize_preference_text(product_preference_text(product))
     if not product_tokens:
         return 0.0
-    matched = input_tokens & product_tokens
-    return clamp_unit(len(matched) / max(len(input_tokens), 1))
+    return preference_token_match_score(input_tokens, product_tokens)
 
 
 ## 상품 카테고리와 사용목적에서 구매 필요성 점수를 추정합니다.
@@ -515,6 +521,84 @@ def product_trust_score(
     return clamp_unit(rating_score * 0.25 + volume_score * 0.25 + source_score * 0.50)
 
 
+## 사용자 특성정보를 구매부담과 후회위험에 직접 연결되는 파생 피처로 변환합니다.
+def user_profile_risk_features(
+    user: Dict[str, Any],
+    product: Dict[str, Any],
+    effective_budget: float,
+) -> Dict[str, float]:
+    price = safe_float(product.get("price"))
+    monthly_income = safe_float(user.get("monthly_income"))
+    age = safe_int(user.get("age"), 40)
+    job = str(user.get("job") or "").strip()
+    marital_status = str(user.get("marital_status") or "").strip()
+    consumption_type = str(user.get("consumption_type") or "").strip()
+    category = normalize_category(product.get("category"))
+
+    income_price_burden = price / max(monthly_income, 1.0) if monthly_income > 0 and price > 0 else 0.0
+    income_budget_burden = effective_budget / max(monthly_income, 1.0) if monthly_income > 0 and effective_budget > 0 else 0.0
+
+    consumption_risk_map = {
+        "보수적": 0.30,
+        "균형형": 0.45,
+        "가성비형": 0.38,
+        "프리미엄형": 0.48,
+        "충동형": 0.82,
+    }
+    consumption_risk = consumption_risk_map.get(consumption_type, 0.45)
+
+    if age <= 24:
+        age_risk = 0.62
+    elif age <= 34:
+        age_risk = 0.50
+    elif age <= 54:
+        age_risk = 0.42
+    elif age <= 69:
+        age_risk = 0.48
+    else:
+        age_risk = 0.58
+
+    job_stability_map = {
+        "전문직": 0.85,
+        "공무원": 0.82,
+        "사무직": 0.72,
+        "기술직": 0.70,
+        "영업직": 0.58,
+        "서비스직": 0.55,
+        "자영업": 0.50,
+        "프리랜서": 0.45,
+        "주부": 0.48,
+        "학생": 0.35,
+        "무직": 0.22,
+        "기타": 0.50,
+    }
+    job_stability = job_stability_map.get(job, 0.55)
+
+    household_adjustment = 0.40
+    if marital_status == "기혼":
+        household_adjustment += 0.12
+        if category in {"명품", "여행", "패션", "화장품"}:
+            household_adjustment += 0.08
+    elif marital_status == "미혼":
+        household_adjustment -= 0.04
+
+    impulse_risk = consumption_risk
+    if consumption_type == "충동형" and price >= 500_000:
+        impulse_risk += 0.12
+    if monthly_income > 0 and price > monthly_income * 0.5:
+        impulse_risk += 0.10
+
+    return {
+        "월수입대비가격부담율": min(income_price_burden, 3.0),
+        "월수입대비예산부담율": min(income_budget_burden, 1.5),
+        "소비성향위험도": clamp_unit(consumption_risk),
+        "연령대위험도": clamp_unit(age_risk),
+        "직업소득안정성": clamp_unit(job_stability),
+        "가구부담보정값": clamp_unit(household_adjustment),
+        "충동구매위험도": clamp_unit(impulse_risk),
+    }
+
+
 ## 가격, 조건 적합도, 대체상품 가능성 등 구매후회 핵심 입력지표를 산출합니다.
 def purchase_decision_features(
     user: Dict[str, Any],
@@ -531,6 +615,7 @@ def purchase_decision_features(
     if budget <= 0:
         monthly_income = safe_float(user.get("monthly_income"))
         budget = monthly_income * 0.08 if monthly_income > 0 else 0.0
+    profile_features = user_profile_risk_features(user, product, budget)
 
     budget_usage = price / max(budget, 1.0) if budget > 0 else 0.0
     budget_overrun = max(0.0, budget_usage - 1.0)
@@ -579,6 +664,7 @@ def purchase_decision_features(
     return {
         "예산초과율": clamp_unit(budget_overrun),
         "예산사용율": min(budget_usage, 3.0),
+        **profile_features,
         "사용목적적합도": purpose_fit,
         "중요요소일치도": factor_fit,
         "브랜드선호일치도": brand_fit,
@@ -791,6 +877,43 @@ def make_regret_causes(
             "impact_score": 0.25,
         })
 
+    decision_features = purchase_decision_features(user, product)
+    income_price_burden = safe_float(decision_features.get("월수입대비가격부담율"))
+    consumption_type = str(user.get("consumption_type") or "").strip()
+    job = str(user.get("job") or "").strip()
+    if income_price_burden >= 0.5:
+        causes.append({
+            "code": "INCOME_PRICE_BURDEN",
+            "title": "소득 대비 가격 부담",
+            "message": f"상품 가격이 월수입의 {income_price_burden * 100:.1f}% 수준이라 구매 후 지출 부담을 느낄 가능성이 있습니다.",
+            "severity": "high" if income_price_burden >= 0.8 else "medium",
+            "impact_score": round(min(income_price_burden, 1.0), 4),
+        })
+    if consumption_type == "충동형" and price >= 500_000:
+        causes.append({
+            "code": "IMPULSE_HIGH_PRICE",
+            "title": "충동구매 위험",
+            "message": "소비성향이 충동형이고 상품 가격이 높아 구매 직후 후회 가능성이 커질 수 있습니다.",
+            "severity": "medium",
+            "impact_score": 0.34,
+        })
+    if consumption_type == "보수적" and budget > 0 and price > budget:
+        causes.append({
+            "code": "CONSERVATIVE_OVER_BUDGET",
+            "title": "보수적 소비성향과 예산 초과",
+            "message": "보수적 소비성향에서는 예산을 넘는 구매가 심리적 부담과 후회로 이어질 가능성이 큽니다.",
+            "severity": "medium",
+            "impact_score": 0.31,
+        })
+    if job in {"학생", "무직"} and price >= 500_000:
+        causes.append({
+            "code": "JOB_INCOME_STABILITY_RISK",
+            "title": "소득 안정성 대비 고가 구매",
+            "message": f"직업 정보({job})를 기준으로 볼 때 고가 상품 구매 부담이 상대적으로 클 수 있습니다.",
+            "severity": "medium",
+            "impact_score": 0.30,
+        })
+
     risk_keywords = detect_product_risk_keywords(product)
     if risk_keywords:
         causes.append({
@@ -883,6 +1006,49 @@ def product_preference_text(
         for key in ["name", "brand", "category", "description"]
     )
     return f"{base_text} {normalize_category(product.get('category'))}"
+
+
+## 두 선호 토큰이 완전 일치 또는 의미 있는 부분 일치 관계인지 판단합니다.
+def preference_tokens_match(
+    left: str,
+    right: str,
+) -> bool:
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if len(left) < 2 or len(right) < 2:
+        return False
+    return left in right or right in left
+
+
+## 입력 토큰 중 상품 토큰과 일치하거나 부분 일치하는 토큰을 찾습니다.
+def matched_preference_tokens(
+    input_tokens: set[str],
+    product_tokens: set[str],
+) -> set[str]:
+    return {
+        input_token
+        for input_token in input_tokens
+        if any(preference_tokens_match(input_token, product_token) for product_token in product_tokens)
+    }
+
+
+## 별칭 확장으로 분모가 커지는 문제를 줄여 선호 토큰 매칭 점수를 계산합니다.
+def preference_token_match_score(
+    input_tokens: set[str],
+    product_tokens: set[str],
+) -> float:
+    if not input_tokens:
+        return 0.5
+    if not product_tokens:
+        return 0.0
+    matched = matched_preference_tokens(input_tokens, product_tokens)
+    if not matched:
+        return 0.0
+    compact_denominator = max(min(len(input_tokens), 4), 1)
+    score = len(matched) / compact_denominator
+    return clamp_unit(max(score, 0.35))
 
 
 ## LLM 응답 문자열에서 JSON 객체를 추출합니다.
@@ -1224,12 +1390,8 @@ def preference_alignment(
 
     brand_fit = resolve_brand_fit_score(preferred_tokens, brand_tokens, llm_scores)
     matched_preferred = bool(preferred_tokens) and brand_fit >= 0.8
-    condition_matches = condition_tokens & product_tokens
-    condition_similarity = (
-        len(condition_matches) / max(len(condition_tokens), 1)
-        if condition_tokens
-        else 0.0
-    )
+    condition_matches = matched_preference_tokens(condition_tokens, product_tokens)
+    condition_similarity = preference_token_match_score(condition_tokens, product_tokens) if condition_tokens else 0.0
 
     price = safe_float(product.get("price"))
     budget = safe_float(user.get("budget"))
@@ -1310,7 +1472,7 @@ def explicit_risk_score(
     score = 0.0
     if budget > 0 and price > budget:
         over_ratio = (price - budget) / budget
-        score += min(0.12 + math.log1p(over_ratio) * 0.09, 0.78)
+        score += min(0.16 + math.log1p(over_ratio) * 0.12, 0.82)
     elif budget > 0 and price > budget * 0.85:
         near_ratio = (price - budget * 0.85) / max(budget * 0.15, 1.0)
         score += 0.06 + near_ratio * 0.08
@@ -1327,6 +1489,37 @@ def explicit_risk_score(
     score += max(0.0, 0.5 - decision_features["구매필요성점수"]) * 0.06
     score += max(0.0, 0.55 - decision_features["상품신뢰도"]) * 0.05
     score += max(0.0, 0.5 - decision_features["데이터신뢰도"]) * 0.04
+    score += max(0.0, decision_features["월수입대비가격부담율"] - 0.25) * 0.16
+    score += max(0.0, decision_features["월수입대비예산부담율"] - 0.12) * 0.08
+    score += decision_features["소비성향위험도"] * 0.10
+    score += decision_features["충동구매위험도"] * 0.08
+    score += decision_features["연령대위험도"] * 0.06
+    score += max(0.0, 0.55 - decision_features["직업소득안정성"]) * 0.14
+    score += max(0.0, decision_features["가구부담보정값"] - 0.45) * 0.12
+
+    consumption_type = str(user.get("consumption_type") or "").strip()
+    job = str(user.get("job") or "").strip()
+    marital_status = str(user.get("marital_status") or "").strip()
+    age = safe_int(user.get("age"), 40)
+    monthly_income = safe_float(user.get("monthly_income"))
+    if consumption_type == "충동형" and price >= 500_000:
+        score += 0.09
+    if consumption_type == "보수적" and budget > 0 and price > budget:
+        score += 0.09
+    if consumption_type == "가성비형" and rating < 4.2:
+        score += 0.06
+    if consumption_type == "프리미엄형" and (rating_missing or rating < 4.4):
+        score += 0.06
+    if job in {"학생", "무직"} and price >= 500_000:
+        score += 0.11
+    if age <= 24 and price >= 500_000:
+        score += 0.05
+    elif age >= 70 and price >= 500_000:
+        score += 0.04
+    if marital_status == "기혼" and monthly_income > 0 and price > monthly_income * 0.35:
+        score += 0.04
+    if monthly_income > 0 and price > monthly_income * 0.5:
+        score += 0.10
 
     if not rating_missing and rating < 4.2:
         score += min((4.2 - rating) / 2.2, 1.0) * 0.08
@@ -1822,14 +2015,19 @@ class RegretPredictor:
         rule_score = explicit_risk_score(user, scoring_product)
         base_regret_score = calibrate_regret_score(model_score, rule_score)
         alignment = preference_alignment(user, scoring_product)
-        regret_score = clamp_score(base_regret_score + alignment["adjustment"])
+        preference_adjustment = alignment["adjustment"]
+        if rule_score >= 0.65 and preference_adjustment < 0:
+            preference_adjustment = max(preference_adjustment, -0.04)
+        elif rule_score >= 0.4 and preference_adjustment < 0:
+            preference_adjustment = max(preference_adjustment, -0.05)
+        regret_score = clamp_score(base_regret_score + preference_adjustment)
         causes = make_regret_causes(regret_score, user, scoring_product, alignment)
         return {
             "feature": row,
             "model_regret_score": model_score,
             "cause_score": rule_score,
             "base_regret_score": base_regret_score,
-            "preference_adjustment": alignment["adjustment"],
+            "preference_adjustment": preference_adjustment,
             "preference_alignment": alignment,
             "llm_preference_evaluation": llm_preference,
             "decision_features": purchase_decision_features(user, scoring_product),
@@ -2312,7 +2510,7 @@ def main() -> None:
     train_parser.add_argument("--data", default=str(DEFAULT_DATASET_PATH), help="Path to xlsx/csv training dataset.")
     train_parser.add_argument("--model", default=str(DEFAULT_MODEL_PATH), help="Output model path.")
     train_parser.add_argument("--model-type", choices=["torch"], default="torch", help="Estimator type.")
-    train_parser.add_argument("--epochs", type=int, default=800, help="Maximum training epochs.")
+    train_parser.add_argument("--epochs", type=int, default=100, help="Maximum training epochs.")
     train_parser.add_argument("--batch-size", type=int, default=64, help="Training batch size.")
     train_parser.add_argument("--learning-rate", type=float, default=0.001, help="AdamW learning rate.")
     train_parser.add_argument("--log-interval", type=int, default=1, help="Print training metrics every N epochs.")

@@ -7,9 +7,9 @@
  */
 import { useState } from "react";
 import { Link } from "wouter";
-import { ShoppingCart, RotateCcw, Wifi, WifiOff, ChevronRight, Sun, Moon, History, CheckCircle2 } from "lucide-react";
+import { ShoppingCart, RotateCcw, Wifi, WifiOff, ChevronRight, Sun, Moon, History, CheckCircle2, UserRound } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useStopBuyWS } from "@/hooks/useStopBuyWS";
+import { useStopBuyWS, type UserProfile } from "@/hooks/useStopBuyWS";
 import { ProductInputForm } from "@/components/ProductInputForm";
 import { StopBuyLogo } from "@/components/StopBuyLogo";
 import { AnalysisProgress } from "@/components/AnalysisProgress";
@@ -17,6 +17,7 @@ import { RegretGauge } from "@/components/RegretGauge";
 import { RegretCauseList } from "@/components/RegretCauseList";
 import { AlternativeCard } from "@/components/AlternativeCard";
 import { LLMAnalysisPanel } from "@/components/LLMAnalysisPanel";
+import { UserProfileSettings, loadSavedUserProfile } from "@/components/UserProfileSettings";
 import { useTheme } from "@/contexts/ThemeContext";
 
 const HERO_BG = "https://d2xsxph8kpxj0f.cloudfront.net/310519663632451254/8SbY3RBNCHrKBA7jPh2CJe/stopbuy_hero-KnzLRbMywdJiHKwExzwAxg.webp";
@@ -41,6 +42,8 @@ export default function Home() {
   const [activeResultTab, setActiveResultTab] = useState<"causes" | "alternatives" | "analysis">(
     "causes"
   );
+  const [isUserProfileOpen, setIsUserProfileOpen] = useState(false);
+  const [savedUserProfile, setSavedUserProfile] = useState<UserProfile>(() => loadSavedUserProfile());
 
   const isAnalyzing = status === "connecting" || status === "analyzing";
   const isSelectingProduct = status === "selecting_product";
@@ -50,7 +53,13 @@ export default function Home() {
 
   const handleAnalyze = (params: Parameters<typeof analyze>[0]) => {
     setActiveResultTab("causes");
-    analyze(params);
+    analyze({
+      ...params,
+      user: {
+        ...savedUserProfile,
+        ...(params.user || {}),
+      },
+    });
   };
 
   return (
@@ -101,6 +110,19 @@ export default function Home() {
           </div>
 
           {/* 이력 페이지 링크 */}
+          <button
+            type="button"
+            onClick={() => setIsUserProfileOpen(true)}
+            className="flex items-center gap-1.5 text-xs h-8 px-2 rounded-lg transition-colors"
+            style={{ color: "var(--sb-text-muted)", background: "transparent" }}
+            onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.background = isDark ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.06)"; }}
+            onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = "transparent"; }}
+            title="내정보설정"
+          >
+            <UserRound size={14} />
+            <span className="hidden sm:inline">내정보설정</span>
+          </button>
+
           <Link href="/history">
             <button
               className="flex items-center gap-1.5 text-xs h-8 px-2 rounded-lg transition-colors"
@@ -153,6 +175,13 @@ export default function Home() {
           </button>
         </div>
       </header>
+
+      <UserProfileSettings
+        open={isUserProfileOpen}
+        profile={savedUserProfile}
+        onOpenChange={setIsUserProfileOpen}
+        onSave={setSavedUserProfile}
+      />
 
       {/* ── 히어로 배너 (분석 전만 표시) ── */}
       {status === "idle" && (
@@ -264,10 +293,10 @@ export default function Home() {
                         className="font-semibold text-base"
                         style={{ color: "var(--sb-text-primary)", fontFamily: "'Space Grotesk', monospace" }}
                       >
-                        {"\ub124\uc774\ubc84 \uc1fc\ud551 \uc0c1\ud488 \ud6c4\ubcf4"}
+                        네이버 쇼핑 상품 후보
                       </h3>
                       <p className="text-xs mt-1" style={{ color: "var(--sb-text-muted)" }}>
-                        {"\uc774\ubbf8\uc9c0\uc5d0\uc11c \ucd94\uc815\ud55c \uc0c1\ud488\uacfc \uac00\uc7a5 \uac00\uae4c\uc6b4 \ud56d\ubaa9\uc744 \uc120\ud0dd\ud558\uba74 \ud574\ub2f9 \uc0c1\ud488\uc73c\ub85c \ud6c4\ud68c \uc608\uce21\uc744 \uc9c4\ud589\ud569\ub2c8\ub2e4."}
+                        이미지에서 추정한 상품과 가장 가까운 항목을 선택하면 해당 상품으로 후회 예측을 진행합니다.
                       </p>
                     </div>
                     {candidateQuery && (
@@ -285,7 +314,7 @@ export default function Home() {
                       className="rounded-xl p-3 text-xs"
                       style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)", color: "var(--sb-text-muted)" }}
                     >
-                      {"\uc774\ubbf8\uc9c0 \ubd84\uc11d \uacb0\uacfc: "}<span style={{ color: "var(--sb-text-primary)" }}>{extractedProduct.name}</span>
+                      이미지 분석 결과: <span style={{ color: "var(--sb-text-primary)" }}>{extractedProduct.name}</span>
                     </div>
                   )}
 
@@ -295,7 +324,7 @@ export default function Home() {
                         <button
                           key={candidate.product_id ?? `${candidate.name}-${index}`}
                           type="button"
-                          onClick={() => selectProductCandidate(candidate)}
+                          onClick={() => selectProductCandidate(candidate, savedUserProfile)}
                           className="group text-left rounded-xl overflow-hidden transition-all duration-150"
                           style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
                           onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--sb-blue)"; }}
@@ -303,7 +332,7 @@ export default function Home() {
                         >
                           <div className="aspect-square w-full overflow-hidden" style={{ background: "var(--sb-card-bg)" }}>
                             {candidate.image_url ? (
-                              <img src={candidate.image_url} alt={candidate.name || "\uc0c1\ud488 \ud6c4\ubcf4"} className="w-full h-full object-cover" />
+                              <img src={candidate.image_url} alt={candidate.name || "상품 후보"} className="w-full h-full object-cover" />
                             ) : (
                               <div className="w-full h-full flex items-center justify-center" style={{ color: "var(--sb-text-dim)" }}>
                                 <ShoppingCart size={28} />
@@ -313,18 +342,18 @@ export default function Home() {
                           <div className="p-3 flex flex-col gap-2">
                             <div className="min-h-10">
                               <p className="text-sm font-semibold line-clamp-2" style={{ color: "var(--sb-text-primary)" }}>
-                                {candidate.name || "\uc0c1\ud488\uba85 \ubbf8\ud655\uc778"}
+                                {candidate.name || "상품명 미확인"}
                               </p>
                               <p className="text-xs mt-1 truncate" style={{ color: "var(--sb-text-dim)" }}>
-                                {[candidate.mall_name, candidate.brand, candidate.category].filter(Boolean).join(" \u00b7 ") || "\ub124\uc774\ubc84 \uc1fc\ud551"}
+                                {[candidate.mall_name, candidate.brand, candidate.category].filter(Boolean).join(" · ") || "네이버 쇼핑"}
                               </p>
                             </div>
                             <div className="flex items-center justify-between gap-2">
                               <span className="font-bold text-sm" style={{ color: "var(--sb-blue-light)", fontFamily: "'Space Grotesk', monospace" }}>
-                                {candidate.price ? `${candidate.price.toLocaleString()}\uc6d0` : "\uac00\uaca9 \ubbf8\ud655\uc778"}
+                                {candidate.price ? `${candidate.price.toLocaleString()}원` : "가격 미확인"}
                               </span>
                               <span className="inline-flex items-center gap-1 text-xs font-medium" style={{ color: "var(--sb-green)" }}>
-                                <CheckCircle2 size={13} /> {"\uc120\ud0dd"}
+                                <CheckCircle2 size={13} /> 선택
                               </span>
                             </div>
                           </div>
@@ -336,7 +365,7 @@ export default function Home() {
                       className="rounded-xl p-6 text-center text-sm"
                       style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)", color: "var(--sb-text-muted)" }}
                     >
-                      {"\ub124\uc774\ubc84 \uc1fc\ud551\uc5d0\uc11c \uc720\uc0ac \uc0c1\ud488\uc744 \ucc3e\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4. \uc774\ubbf8\uc9c0\uac00 \uc120\uba85\ud55c\uc9c0 \ud655\uc778\ud55c \ub4a4 \ub2e4\uc2dc \uc2dc\ub3c4\ud574\uc8fc\uc138\uc694."}
+                      네이버 쇼핑에서 유사 상품을 찾지 못했습니다. 이미지가 선명한지 확인한 뒤 다시 시도해주세요.
                     </div>
                   )}
                 </div>
