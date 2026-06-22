@@ -401,7 +401,7 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
       completionTimerRef.current = setTimeout(() => {
         setStatus("completed");
         completionTimerRef.current = null;
-      }, 2000);
+      }, 200);
     } else if (type === "error") {
       setError(message.message || "알 수 없는 오류가 발생했습니다.");
       setStatus("error");

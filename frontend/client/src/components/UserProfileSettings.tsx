@@ -199,7 +199,6 @@ export function UserProfileSettings({
               <option value="">선택 안 함</option>
               <option value="male">남성</option>
               <option value="female">여성</option>
-              <option value="other">기타</option>
             </select>
           </div>
           <div>
