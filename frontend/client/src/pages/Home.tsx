@@ -414,18 +414,6 @@ export default function Home() {
 
                       {/* 상품 정보 + 스코어 요약 */}
                       <div className="flex-1 min-w-0">
-                        {result._demo && (
-                          <div
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs mb-3"
-                            style={{
-                              background: "color-mix(in oklch, var(--sb-blue-light) 10%, transparent)",
-                              color: "var(--sb-blue-light)",
-                              border: "1px solid color-mix(in oklch, var(--sb-blue-light) 25%, transparent)",
-                            }}
-                          >
-                            <span>⚡</span> 데모 결과 (백엔드 연결 시 실제 분석)
-                          </div>
-                        )}
 
                         <div className="mb-4">
                           <h2
