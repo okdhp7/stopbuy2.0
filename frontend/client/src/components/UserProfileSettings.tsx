@@ -188,7 +188,7 @@ export function UserProfileSettings({
             내정보설정
           </DialogTitle>
           <DialogDescription style={{ color: "#64748B" }}>
-            저장한 정보는 이 브라우저의 localStorage에 보관되며 구매후회예측 입력정보로 사용됩니다.
+            입력하신 정보는 구매후회예측을 위한 입력정보로 사용됩니다.
           </DialogDescription>
         </DialogHeader>
 
@@ -213,7 +213,7 @@ export function UserProfileSettings({
           <div>
             <Label className="text-xs mb-1.5 block" style={whiteLabelStyle}>월수입</Label>
             <div className="flex items-center gap-2">
-              <Input value={monthlyIncomeManwon} onChange={(event) => setMonthlyIncomeManwon(event.target.value)} placeholder="예: 379" type="number" min="0" className="text-sm" style={whiteInputStyle} />
+              <Input value={monthlyIncomeManwon} onChange={(event) => setMonthlyIncomeManwon(event.target.value)} placeholder="예: 379" type="number" min="0" step={50} className="text-sm" style={whiteInputStyle} />
               <span className="text-sm shrink-0" style={{ color: "#475569" }}>만원</span>
             </div>
           </div>

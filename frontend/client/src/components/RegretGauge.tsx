@@ -82,15 +82,6 @@ export function RegretGauge({ score, level, size = 200, animated = true }: Regre
     <div className="flex flex-col items-center gap-3">
       <div className="relative" style={{ width: size, height: size }}>
         <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
-          <defs>
-            <filter id={`glow-${level}`} x="-50%" y="-50%" width="200%" height="200%">
-              <feGaussianBlur stdDeviation="4" result="coloredBlur" />
-              <feMerge>
-                <feMergeNode in="coloredBlur" />
-                <feMergeNode in="SourceGraphic" />
-              </feMerge>
-            </filter>
-          </defs>
 
           {/* 트랙 (배경 원호) */}
           <circle
@@ -115,8 +106,7 @@ export function RegretGauge({ score, level, size = 200, animated = true }: Regre
             strokeDasharray={`${arcLength} ${circumference}`}
             strokeDashoffset={strokeDashoffset}
             strokeLinecap="round"
-            transform={`rotate(${rotation} ${center} ${center})`}
-            filter={`url(#glow-${level})`}
+            transform={`rotate(${rotation} ${center} ${center})`}
             style={{ transition: "none" }}
           />
 
@@ -138,7 +128,6 @@ export function RegretGauge({ score, level, size = 200, animated = true }: Regre
             style={{
               fontSize: size * 0.22,
               color: c,
-              textShadow: `0 0 20px ${c}80`,
             }}
           >
             {displayScore}
