@@ -40,11 +40,13 @@ CATEGORY_KEYWORDS = {
     "전기면도기": ["면도기", "전기면도기", "shaver", "razor", "쉐이버"],
 }
 
-GENERIC_URL_PRODUCT_NAMES = {"URL 입력 상품", "상품", "product", "unknown", "null"}
+GENERIC_URL_PRODUCT_NAMES = {"URL 입력 상품", "상품", "product", "unknown", "null", "에러 페이지"}
 GENERIC_PAGE_TITLES = {
     "G마켓 - 쇼핑을 바꾸는 쇼핑",
     "G마켓",
     "Access Denied",
+    "에러 페이지",
+    "잠시 후 다시 확인해주세요! : 네이버 쇼핑",
 }
 PRICE_KEY_PRIORITY = {
     "finalprice": 0,
@@ -223,8 +225,18 @@ def extract_naver_store_url_info(
     host = parsed.netloc.lower()
     path_parts = [unquote(part) for part in parsed.path.split("/") if part]
     result: Dict[str, Optional[str]] = {"brand_slug": None, "brand": None, "product_id": None}
-    if "brand.naver.com" not in host and "smartstore.naver.com" not in host:
+    is_naver_store = "brand.naver.com" in host or "smartstore.naver.com" in host
+    is_naver_shopping = "shopping.naver.com" in host
+    if not is_naver_store and not is_naver_shopping:
         return result
+
+    if is_naver_shopping:
+        for index, part in enumerate(path_parts):
+            if part.lower() in {"window-products", "products", "product", "catalog"} and index + 1 < len(path_parts):
+                for candidate in path_parts[index + 1:]:
+                    if candidate.isdigit():
+                        result["product_id"] = candidate
+                        return result
 
     if path_parts:
         slug = path_parts[0].strip()
@@ -246,7 +258,7 @@ def extract_naver_product_id_from_url(
     url: Any,
 ) -> Optional[str]:
     text = str(url or "")
-    match = re.search(r"/(?:products|product|catalog)/(\d+)", text)
+    match = re.search(r"/(?:window-products/[^/]+|products|product|catalog)/(\d+)", text)
     return match.group(1) if match else None
 
 
@@ -357,6 +369,23 @@ def extract_url_query_hint(
     if meaningful_parts:
         return clean_product_title(" ".join(meaningful_parts[:3]))
     return None
+
+
+## URL 추출 결과가 네이버/쇼핑몰 오류 페이지인지 판단합니다.
+def is_error_page_product(
+    product: Dict[str, Any],
+) -> bool:
+    text = " ".join(str(product.get(key) or "") for key in ("name", "description"))
+    return any(
+        keyword in text
+        for keyword in [
+            "에러 페이지",
+            "Access Denied",
+            "잠시 후 다시 확인",
+            "자동화된 접근",
+            "접근이 제한",
+        ]
+    )
 
 
 ## URL 추출 결과가 기본값 수준인지 판단합니다.
@@ -1382,6 +1411,15 @@ async def finalize_url_product(
         product = await enrich_product_with_llm(product, visible_text)
     if not product.get("brand"):
         product["brand"] = infer_brand_from_text(product.get("name"), product.get("description"), product.get("url_query"), url)
+    if is_error_page_product(product) or product.get("name") in GENERIC_PAGE_TITLES:
+        product["product_info_missing"] = True
+        product["name"] = "URL 입력 상품"
+        product["brand"] = None
+        product["category"] = None
+        product["price"] = 0
+        product["price_missing"] = True
+        if product.get("url_query") and not product.get("search_query"):
+            product["search_query"] = product.get("url_query")
     return product
 
 
