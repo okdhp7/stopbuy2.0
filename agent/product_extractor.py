@@ -960,6 +960,7 @@ def parse_naver_product_data(
 def merge_naver_candidate(
     product: Dict[str, Any],
     candidate: Dict[str, Any],
+    allow_loose_identity_merge: bool = False,
 ) -> Dict[str, Any]:
     merged = dict(product)
     naver_store = merged.get("naver_store") if isinstance(merged.get("naver_store"), dict) else {}
@@ -980,28 +981,31 @@ def merge_naver_candidate(
         or bool(merged.get("name_from_url_hint"))
         or str(merged.get("name") or "").strip() == str(merged.get("url_query") or "").strip()
     )
-    if should_replace_name and candidate.get("name"):
+    can_merge_identity = same_naver_product or allow_loose_identity_merge
+    if can_merge_identity and should_replace_name and candidate.get("name"):
         merged["name"] = candidate["name"]
         merged["name_from_url_hint"] = False
-    if (same_naver_product or not merged.get("brand")) and candidate.get("brand"):
+    if can_merge_identity and (same_naver_product or not merged.get("brand")) and candidate.get("brand"):
         merged["brand"] = candidate["brand"]
-    if (same_naver_product or not merged.get("category")) and candidate.get("category"):
+    if can_merge_identity and (same_naver_product or not merged.get("category")) and candidate.get("category"):
         merged["category"] = candidate["category"]
-    if (same_naver_product or not merged.get("image_url")) and candidate.get("image_url"):
+    if can_merge_identity and (same_naver_product or not merged.get("image_url")) and candidate.get("image_url"):
         merged["image_url"] = candidate["image_url"]
     current_price = _number_from_text(str(merged.get("price"))) or 0
     candidate_price = _number_from_text(str(candidate.get("price"))) or 0
-    if candidate_price and (same_naver_product or not current_price or current_price < 1000):
+    if candidate_price and (same_naver_product or (allow_loose_identity_merge and (not current_price or current_price < 1000))):
         merged["price"] = candidate["price"]
-    if not merged.get("rating") and candidate.get("rating") is not None:
-        merged["rating"] = candidate["rating"]
-    if not merged.get("review_count") and candidate.get("review_count") is not None:
-        merged["review_count"] = candidate["review_count"]
-    if candidate.get("review_data_available"):
-        merged["review_data_available"] = True
-        merged["review_source"] = candidate.get("review_source")
-        merged["review_texts"] = candidate.get("review_texts") or []
-    merged["naver_enriched"] = True
+    if can_merge_identity:
+        if not merged.get("rating") and candidate.get("rating") is not None:
+            merged["rating"] = candidate["rating"]
+        if not merged.get("review_count") and candidate.get("review_count") is not None:
+            merged["review_count"] = candidate["review_count"]
+        if candidate.get("review_data_available"):
+            merged["review_data_available"] = True
+            merged["review_source"] = candidate.get("review_source")
+            merged["review_texts"] = candidate.get("review_texts") or []
+    merged["naver_enriched"] = can_merge_identity
+    merged["naver_identity_merged"] = can_merge_identity
     merged["naver_candidate"] = {
         "name": candidate.get("name"),
         "brand": candidate.get("brand"),
@@ -1186,7 +1190,8 @@ async def enrich_product_with_naver_search(
         return product
     if score < 0.05 and not is_generic_product_name(product.get("name")) and not product.get("name_from_url_hint"):
         return product
-    enriched = merge_naver_candidate(product, best_candidate)
+    allow_loose_identity_merge = bool(matched_candidate)
+    enriched = merge_naver_candidate(product, best_candidate, allow_loose_identity_merge=allow_loose_identity_merge)
     enriched["naver_enrichment_query"] = used_query
     enriched["naver_enrichment_queries"] = queries
     enriched["naver_enrichment_score"] = round(score, 4)
@@ -1288,7 +1293,9 @@ async def fallback_product_from_url(
         "name": "URL 입력 상품",
         "brand": inferred_brand,
         "source_url": url,
+        "product_url": url,
         "shop": shop,
+        "product_info_missing": True,
         "description": "URL에서 상품 정보를 자동 추출하지 못해 URL 단서와 네이버 쇼핑 검색으로 보강합니다.",
         "url_query": query_hint,
         "name_from_url_hint": bool(query_hint),
@@ -1325,9 +1332,11 @@ async def fallback_product_from_url(
         product["brand"] = infer_brand_from_text(product.get("name"), product.get("description"), query_hint, url)
     if not product.get("category"):
         product["category"] = detect_category(f"{product.get('name', '')} {product.get('description', '')}")
-    if is_generic_product_name(product.get("name")) and query_hint:
-        product["name"] = query_hint
+    if query_hint and not product.get("search_query"):
+        product["search_query"] = query_hint
     product.setdefault("price", 0)
+    if not (_number_from_text(str(product.get("price"))) or 0):
+        product["price_missing"] = True
     product.setdefault("rating", 3.5)
     product.setdefault("review_count", 0)
     product.setdefault("return_rate", 5.0)
@@ -1349,7 +1358,8 @@ async def finalize_url_product(
     if not product.get("brand"):
         product["brand"] = infer_brand_from_text(product.get("name"), product.get("description"), product.get("url_query"), visible_text[:1000], url)
     if not product.get("price"):
-        product["price"] = _number_from_text(visible_text) or 0
+        product["price"] = 0
+        product["price_missing"] = True
     if not product.get("rating"):
         product["rating"] = 3.5
     if not product.get("review_count"):

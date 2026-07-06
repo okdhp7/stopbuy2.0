@@ -49,6 +49,13 @@ export default function Home() {
   const isSelectingProduct = status === "selecting_product";
   const hasResult = status === "completed" && result;
   const hasError = status === "error";
+  const targetProduct = result?.product;
+  const targetProductName = result?.product_name || targetProduct?.name || "분석 상품";
+  const targetProductImageUrl = targetProduct?.image_url;
+  const targetProductUrl = targetProduct?.product_url || targetProduct?.source_url;
+  const targetDisplayPrice = targetProduct?.display_price ?? (!targetProduct?.price_estimated ? targetProduct?.price : null);
+  const isTargetPriceEstimated = Boolean(targetProduct?.price_estimated || targetProduct?.price_missing);
+  const isTargetProductInfoMissing = Boolean(targetProduct?.product_info_missing);
   const isDark = theme === "dark";
 
   const handleAnalyze = (params: Parameters<typeof analyze>[0]) => {
@@ -415,44 +422,74 @@ export default function Home() {
                       {/* 상품 정보 + 스코어 요약 */}
                       <div className="flex-1 min-w-0">
 
-                        <div className="mb-4">
-                          <h2
-                            className="font-bold text-lg leading-snug"
-                            style={{ color: "var(--sb-text-primary)", fontFamily: "'Space Grotesk', monospace" }}
-                          >
-                            {result.product_name || result.product?.name || "분석 상품"}
-                          </h2>
-                          {(result.product?.brand || result.product?.category || result.product?.price != null) && (
-                            <div className="flex flex-wrap items-center gap-2 mt-2 text-xs" style={{ color: "var(--sb-text-muted)" }}>
-                              {result.product?.brand && (
-                                <span
-                                  className="px-2 py-1 rounded-lg"
-                                  style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
-                                >
-                                  브랜드: <strong style={{ color: "var(--sb-text-secondary)" }}>{result.product.brand}</strong>
-                                </span>
-                              )}
-                              {result.product?.category && (
-                                <span
-                                  className="px-2 py-1 rounded-lg"
-                                  style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
-                                >
-                                  카테고리: <strong style={{ color: "var(--sb-text-secondary)" }}>{result.product.category}</strong>
-                                </span>
-                              )}
-                              {result.product?.price != null && (
-                                <span
-                                  className="px-2 py-1 rounded-lg"
-                                  style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
-                                >
-                                  가격: <strong style={{ color: "var(--sb-blue-light)" }}>{result.product.price.toLocaleString("ko-KR")}원</strong>
-                                </span>
-                              )}
-                            </div>
+                        <div className="mb-4 flex items-start gap-3">
+                          {targetProductImageUrl && (
+                            targetProductUrl ? (
+                              <a
+                                href={targetProductUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title="상품 상세 보기"
+                                className="shrink-0 w-16 h-16 sm:w-20 sm:h-20 rounded-xl overflow-hidden transition-transform hover:scale-[1.03]"
+                                style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
+                              >
+                                <img src={targetProductImageUrl} alt={targetProductName || "분석 상품 이미지"} className="w-full h-full object-cover" />
+                              </a>
+                            ) : (
+                              <div
+                                className="shrink-0 w-16 h-16 sm:w-20 sm:h-20 rounded-xl overflow-hidden"
+                                style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
+                              >
+                                <img src={targetProductImageUrl} alt={targetProductName || "분석 상품 이미지"} className="w-full h-full object-cover" />
+                              </div>
+                            )
                           )}
+                          <div className="min-w-0 flex-1">
+                            <h2
+                              className="font-bold text-lg leading-snug"
+                              style={{ color: "var(--sb-text-primary)", fontFamily: "'Space Grotesk', monospace" }}
+                            >
+                              {targetProductName}
+                            </h2>
+                            {(result.product?.brand || result.product?.category || targetDisplayPrice != null || isTargetPriceEstimated || isTargetProductInfoMissing) && (
+                              <div className="flex flex-wrap items-center gap-2 mt-2 text-xs" style={{ color: "var(--sb-text-muted)" }}>
+                                {result.product?.brand && (
+                                  <span
+                                    className="px-2 py-1 rounded-lg"
+                                    style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
+                                  >
+                                    브랜드: <strong style={{ color: "var(--sb-text-secondary)" }}>{result.product.brand}</strong>
+                                  </span>
+                                )}
+                                {result.product?.category && (
+                                  <span
+                                    className="px-2 py-1 rounded-lg"
+                                    style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
+                                  >
+                                    카테고리: <strong style={{ color: "var(--sb-text-secondary)" }}>{result.product.category}</strong>
+                                  </span>
+                                )}
+                                {isTargetProductInfoMissing && (
+                                  <span
+                                    className="px-2 py-1 rounded-lg"
+                                    style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
+                                  >
+                                    상품정보 미확인
+                                  </span>
+                                )}
+                                <span
+                                  className="px-2 py-1 rounded-lg"
+                                  style={{ background: "var(--sb-input-bg)", border: "1px solid var(--sb-input-border)" }}
+                                >
+                                  가격: <strong style={{ color: "var(--sb-blue-light)" }}>
+                                    {targetDisplayPrice != null ? `${targetDisplayPrice.toLocaleString("ko-KR")}원` : "가격 미확인"}
+                                  </strong>
+                                </span>
+                              </div>
+                            )}
+                          </div>
                         </div>
 
-                        {/* 스코어 그리드 */}
                         <div className="grid grid-cols-2 gap-3">
                           {[
                             {

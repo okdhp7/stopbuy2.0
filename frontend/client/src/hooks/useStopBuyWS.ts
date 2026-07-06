@@ -98,6 +98,10 @@ export interface ProductInfo {
   brand?: string;
   category?: string;
   price?: number;
+  display_price?: number | null;
+  estimated_price?: number | null;
+  price_estimated?: boolean;
+  price_missing?: boolean;
   rating?: number;
   review_count?: number;
   return_rate?: number;
@@ -112,6 +116,9 @@ export interface ProductInfo {
   review_data_available?: boolean;
   review_source?: string;
   review_texts?: string[];
+  product_info_missing?: boolean;
+  product_info_source?: string;
+  shop?: string;
 }
 
 export interface ProductCandidate extends ProductInfo {

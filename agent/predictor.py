@@ -2045,15 +2045,19 @@ class RegretPredictor:
         raw_price = safe_float(product.get("price"))
         price_estimated = raw_price <= 0
         normalized_price = estimate_missing_price(product) if price_estimated else raw_price
+        display_price = None if price_estimated else raw_price
+        estimated_price = normalized_price if price_estimated else None
         rating_missing = product.get("rating") in (None, "")
         review_count_missing = product.get("review_count") in (None, "")
         review_data_available = bool(product.get("review_data_available"))
         normalized_product = {
             "name": product.get("name") or "분석 대상 상품",
             "brand": product.get("brand"),
-            "category": product.get("category"),
-            "price": normalized_price,
+            "category": product.get("category"),            "price": normalized_price,
+            "display_price": display_price,
+            "estimated_price": estimated_price,
             "price_estimated": price_estimated,
+            "price_missing": bool(product.get("price_missing")) or price_estimated,
             "rating": safe_float(product.get("rating"), 3.5),
             "rating_missing": rating_missing,
             "review_count": safe_int(product.get("review_count")),
@@ -2066,6 +2070,11 @@ class RegretPredictor:
             "description": product.get("description"),
             "image_url": product.get("image_url"),
             "source_url": product.get("source_url"),
+            "product_url": product.get("product_url") or product.get("source_url"),
+            "shop": product.get("shop"),
+            "product_info_source": product.get("product_info_source"),
+            "product_info_missing": bool(product.get("product_info_missing")),
+            "search_query": product.get("search_query"),
         }
         score_result = self._predict_score(user, normalized_product)
         regret_score = score_result["regret_score"]
