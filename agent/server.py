@@ -102,6 +102,19 @@ async def handle_request(ws: ServerConnection, session_id: str, data: Dict[str, 
         else:
             await send_progress(ws, session_id, 25, "상품 정보를 추출하고 있습니다.")
         product = await extract_product_info(data)
+        if data.get("input_type") == "url" and isinstance(product, dict) and product.get("product_info_missing"):
+            await send_message(ws, {
+                "type": "error",
+                "session_id": session_id,
+                "message": "상품정보를 가져오지 못했습니다. 네이버 로그인 또는 접근 제한으로 상품 상세정보를 확인할 수 없습니다. 다른 상품 URL을 입력하거나 이미지를 업로드하여 재시도하세요.",
+                "data": {
+                    "product_url": product.get("product_url") or product.get("source_url"),
+                    "product_info_source": product.get("product_info_source"),
+                    "url_fetch_error": product.get("url_fetch_error"),
+                    "search_query": product.get("search_query"),
+                },
+            })
+            return
         if data.get("input_type") == "manual" and isinstance(product, dict):
             has_rating = product.get("rating") not in (None, "")
             has_review_count = product.get("review_count") not in (None, "")

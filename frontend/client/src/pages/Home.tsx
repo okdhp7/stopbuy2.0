@@ -56,6 +56,7 @@ export default function Home() {
   const targetDisplayPrice = targetProduct?.display_price ?? (!targetProduct?.price_estimated ? targetProduct?.price : null);
   const isTargetPriceEstimated = Boolean(targetProduct?.price_estimated || targetProduct?.price_missing);
   const isTargetProductInfoMissing = Boolean(targetProduct?.product_info_missing);
+  const errorTitle = error?.includes("상품정보") ? "상품정보 확인 필요" : "요청을 완료하지 못했습니다";
   const isDark = theme === "dark";
 
   const handleAnalyze = (params: Parameters<typeof analyze>[0]) => {
@@ -389,7 +390,7 @@ export default function Home() {
                     <span style={{ fontSize: 24 }}>⚠️</span>
                   </div>
                   <div>
-                    <p className="font-semibold mb-1" style={{ color: "var(--sb-red)" }}>분석 오류</p>
+                    <p className="font-semibold mb-1" style={{ color: "var(--sb-red)" }}>{errorTitle}</p>
                     <p className="text-sm" style={{ color: "var(--sb-text-secondary)" }}>{error}</p>
                   </div>
                   <Button

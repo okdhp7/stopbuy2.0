@@ -39,6 +39,7 @@ export function ProductInputForm({ onSubmit, isAnalyzing }: ProductInputFormProp
   const [showUserProfile, setShowUserProfile] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const urlInputRef = useRef<HTMLInputElement>(null);
 
   const [budget, setBudget] = useState("");
   const [preferredBrands, setPreferredBrands] = useState("");
@@ -165,14 +166,33 @@ export function ProductInputForm({ onSubmit, isAnalyzing }: ProductInputFormProp
           <Label className="text-sm" style={labelStyle}>
             상품 URL을 입력하세요
           </Label>
-          <Input
-            value={productUrl}
-            onChange={(e) => setProductUrl(e.target.value)}
-            placeholder="https://www.coupang.com/vp/products/..."
-            className="flex-1 text-sm"
-            style={inputStyle}
-            onKeyDown={(e) => e.key === "Enter" && canSubmit && handleSubmit()}
-          />
+          <div className="relative">
+            <Input
+              ref={urlInputRef}
+              value={productUrl}
+              onChange={(e) => setProductUrl(e.target.value)}
+              placeholder="https://www.coupang.com/vp/products/..."
+              className="w-full pr-10 text-sm"
+              style={inputStyle}
+              onKeyDown={(e) => e.key === "Enter" && canSubmit && handleSubmit()}
+            />
+            {productUrl && (
+              <button
+                type="button"
+                onClick={() => {
+                  setProductUrl("");
+                  urlInputRef.current?.focus();
+                }}
+                disabled={isAnalyzing}
+                title="URL 입력 초기화"
+                aria-label="URL 입력 초기화"
+                className="absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 rounded-md flex items-center justify-center transition-colors disabled:opacity-40"
+                style={{ color: "var(--sb-text-muted)", background: "transparent" }}
+              >
+                <X size={14} />
+              </button>
+            )}
+          </div>
           <p className="text-xs" style={{ color: "var(--sb-text-dim)" }}>
             쿠팡, G마켓, 11번가, Amazon 등 주요 쇼핑몰 URL을 지원합니다.
           </p>

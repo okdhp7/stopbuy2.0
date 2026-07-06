@@ -1067,19 +1067,24 @@ def build_naver_search_queries(
 ) -> List[str]:
     naver_store = product.get("naver_store") if isinstance(product.get("naver_store"), dict) else {}
     gmarket_product = product.get("gmarket_product") if isinstance(product.get("gmarket_product"), dict) else {}
-    candidates = [
+    product_id = naver_store.get("product_id")
+    store_slug = naver_store.get("brand_slug")
+    store_brand = product.get("brand") or naver_store.get("brand") or store_slug
+    candidates = []
+    if product_id:
+        candidates.extend([
+            " ".join(str(value) for value in [store_brand, product_id] if value),
+            product_id,
+        ])
+    candidates.extend([
         product.get("url_query"),
         " ".join(str(value) for value in [product.get("brand"), product.get("name")] if value and not is_generic_product_name(value)),
         None if is_generic_product_name(product.get("name")) else product.get("name"),
         product.get("brand"),
         naver_store.get("brand"),
+        store_slug,
         gmarket_product.get("keyword"),
-    ]
-    product_id = naver_store.get("product_id")
-    if product_id and any(candidates):
-        candidates.append(" ".join(str(value) for value in [product.get("brand") or naver_store.get("brand"), product_id] if value))
-    if product_id:
-        candidates.append(product_id)
+    ])
     goods_code = gmarket_product.get("goods_code")
     if goods_code and any(candidates):
         candidates.append(" ".join(str(value) for value in [product.get("brand"), product.get("name"), goods_code] if value and not is_generic_product_name(value)))
@@ -1096,6 +1101,32 @@ def build_naver_search_queries(
         if normalized and normalized not in queries:
             queries.append(normalized)
     return queries
+
+
+## 네이버 쇼핑 후보가 원본 네이버 상품 URL의 상품 ID와 같은지 판단합니다.
+def is_same_naver_candidate(
+    source_product_id: str,
+    candidate: Dict[str, Any],
+) -> bool:
+    if not source_product_id:
+        return False
+    candidate_product_ids = {
+        str(value)
+        for value in [
+            candidate.get("naver_product_id"),
+            candidate.get("naver_catalog_id"),
+            extract_naver_product_id_from_url(candidate.get("source_url")),
+            extract_naver_product_id_from_url(candidate.get("product_url")),
+        ]
+        if value
+    }
+    if source_product_id in candidate_product_ids:
+        return True
+    for key in ("source_url", "product_url"):
+        url_text = str(candidate.get(key) or "")
+        if source_product_id and source_product_id in url_text:
+            return True
+    return False
 
 
 ## 네이버 쇼핑 API 결과 중 URL 추출 상품과 가장 유사한 후보를 선택합니다.
@@ -1137,16 +1168,7 @@ async def enrich_product_with_naver_search(
             used_query = query
         if source_product_id and query_candidates:
             for candidate in query_candidates:
-                candidate_product_ids = {
-                    str(value)
-                    for value in [
-                        candidate.get("naver_product_id"),
-                        extract_naver_product_id_from_url(candidate.get("source_url")),
-                        extract_naver_product_id_from_url(candidate.get("product_url")),
-                    ]
-                    if value
-                }
-                if source_product_id in candidate_product_ids:
+                if is_same_naver_candidate(source_product_id, candidate):
                     matched_candidate = candidate
                     candidates = query_candidates
                     used_query = query
@@ -1205,6 +1227,18 @@ async def enrich_product_with_naver_search(
         reference_text,
         f"{best_candidate.get('name', '')} {best_candidate.get('brand', '')}",
     )
+    if source_product_id and not matched_candidate and not has_real_product_name:
+        logger.info(
+            "url naver enrichment skipped: %s",
+            json.dumps({
+                "reason": "naver_product_id_without_exact_match",
+                "product_id": source_product_id,
+                "query": used_query,
+                "candidate_name": best_candidate.get("name"),
+                "candidate_source_url": best_candidate.get("source_url"),
+            }, ensure_ascii=False, indent=2, default=str),
+        )
+        return product
     if source_gmarket_id and not matched_candidate and not has_gmarket_keyword and not has_real_product_name:
         logger.info(
             "url naver enrichment skipped: %s",

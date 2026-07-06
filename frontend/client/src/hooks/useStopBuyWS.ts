@@ -246,7 +246,12 @@ export function useStopBuyWS(options: UseStopBuyWSOptions = {}): UseStopBuyWSRet
         completionTimerRef.current = null;
       }, 200);
     } else if (type === "error") {
-      setError(message.message || "알 수 없는 오류가 발생했습니다.");
+      pendingRequestRef.current = null;
+      retryCountRef.current = 0;
+      clearCompletionTimer();
+      setProgress(100);
+      setProgressMessage(message.message || "요청을 완료하지 못했습니다.");
+      setError(message.message || "요청을 완료하지 못했습니다.");
       setStatus("error");
     }
   }, [clearCompletionTimer]);
